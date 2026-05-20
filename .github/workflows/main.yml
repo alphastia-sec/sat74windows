@@ -27,13 +27,14 @@ jobs:
     - name: Build Plugin
       run: cmake --build build --config Release
 
-    # 5. Instalacja oficjalnego Inno Setup (niezawodna metoda przez Chocolatey)
+    # 5. Bezpieczna instalacja Inno Setup przez Chocolatey
     - name: Install Inno Setup
       run: choco install innosetup --yes
 
-    # 6. Uruchomienie kompilatora instalatora
+    # 6. Uruchomienie kompilatora instalatora (POPRAWIONY BŁĄD SKŁADNI)
     - name: Build Windows Installer
-      run: "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe" installer.iss
+      shell: cmd
+      run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
 
     # 7. Spakowanie i udostępnienie gotowego instalatora .exe do pobrania
     - name: Upload Windows Installer Artifact
