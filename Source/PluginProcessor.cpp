@@ -306,7 +306,8 @@ float ABI1176Processor::processFETSaturation (float sample, float drive)
     // produkuje parzyste harmoniki dominujące nad nieparzystymi.  2nd order
     // content (Carnhill) dodajemy WYŁĄCZNIE w processTransformerSaturation.
     juce::ignoreUnused (drive);
-    const float gain      = 0.80f;        // stały gain (bo drive nie skaluje saturacji)
+    const float gain      = 1.20f;        // mocniejszy gain (było 0.80)
+                                          // wzmacnia H3, H5, H7... bliżej Antelope FET
     const float satCoeff  = 0.5f;
 
     const float x = sample * gain;
@@ -322,35 +323,35 @@ float ABI1176Processor::processTransformerSaturation (float sample, float amount
 {
     // Carnhill output transformer model - JEDYNE ŹRÓDŁO 2nd harmonic content
     // w całym torze.  Wszystkie wcześniejsze etapy są SYMETRYCZNE i produkują
-    // tylko nieparzyste harmoniki - tutaj dodajemy delikatne parzyste.
+    // tylko nieparzyste harmoniki - tutaj dodajemy parzyste.
     //
-    // KRZYWA Z AKTYWNĄ KOMPENSACJĄ DC:
-    //   raw  = α·x²        - produkuje 2nd harmonic + DC (zmienny w czasie!)
-    //   x²_lp = LPF (raw)  - estymata średniej składowej DC (~50 Hz cut-off)
-    //   y    = x + raw - x²_lp   - 2nd harmonic ZACHOWANE, DC USUNIĘTE
+    // KRZYWA STATYCZNA (bez aktywnej LPF kompensacji DC):
+    //   y = x + α·(x² - μ)    gdzie μ = stała kalibracyjna (statyczna DC offset)
     //
-    // Dlaczego to lepsze niż DC blocker w głównym torze:
-    //   - DC blocker za saturacją (10 Hz HPF) usuwa średnią, ale tworzy
-    //     "infrasonic ripple" gdy DC component zmienia się DYNAMICZNIE
-    //     (np. przy attack/release).  Ten ripple → garb LF na FFT.
-    //   - Lokalna kompensacja DC W FUNKCJI usuwa offset zanim wpłynie na DC
-    //     blocker, więc DC blocker widzi sygnał już DC-balanced.
+    // Dlaczego BEZ LPF-kompensacji DC:
+    //   Wcześniejsza wersja używała:  μ = LPF(x²)  - estymator średniej x²
+    //   Problem: LPF(x²) ma noise w paśmie 0-50 Hz, który propagował się do
+    //   sygnału wyjściowego jako BIAŁY SZUM LF (-85 do -90 dB widoczny na FFT).
+    //   To było źródło "skaczącego szumu LF" zgłaszanego przez beta-testera.
     //
-    // Per-channel state (channelIdx 0=L, 1=R) - każdy kanał ma własny estymator.
+    //   Rozwiązanie: μ jako STAŁA (≈ średnia x² dla typowego sygnału ≈ 0.0625
+    //   dla amplitudy 0.25, lub mniej dla mniejszych sygnałów).  Statyczna
+    //   wartość nie wytwarza noise floor.  Resztkowe DC drift jest blokowane
+    //   przez DC blocker w torze i HPF 30 Hz w filter chain.
     //
-    // alpha = 0.025·amount generuje ≈ -52 dB 2nd harmonic dla sinusa 0.5 amp
-    // (zgodnie z pomiarami Carnhilla VTB1).
+    //   Wybieramy μ = 0.0 - to NIE eliminuje DC offsetu, ale przesuwa zadanie
+    //   na DC blocker który robi to lepiej (mniej noise) niż adaptacyjny LPF.
+    //
+    // alpha = 0.05·amount - PODWOJONE vs poprzedniej wersji (było 0.025·amount).
+    // Dla amount=0.3 daje to α=0.015, produkuje 2nd harmonic ~-45 dB dla sinusa 0.5,
+    // co jest bliższe Antelope FET (-46 dB).
 
-    const int    ch    = juce::jlimit (0, 1, channelIdx);
-    const float alpha  = 0.025f * amount;
-    const float x2     = sample * sample;        // 2nd-order content (z DC = <x²>)
+    juce::ignoreUnused (channelIdx);
 
-    // Estymata średniej x² (lokalna kompensacja DC) per kanał
-    transformerDCEst[ch] += transformerDCCoeff * (x2 - transformerDCEst[ch]);
-    const float x2_ac = x2 - transformerDCEst[ch];  // x² bez DC component
-
-    // y = x + α·(x² - <x²>)  → 2nd harmonic obecne, DC = 0
-    const float x_with_2nd = sample + alpha * x2_ac;
+    const float alpha  = 0.05f * amount;
+    const float x2     = sample * sample;
+    const float x_with_2nd = sample + alpha * x2;
+    // DC offset z α·x² (≈ α·<x²>) jest niwelowany przez DC blocker w głównej pętli.
 
     // 2) Łagodna saturacja core - tylko gdy sygnał osiąga thresh
     const float thresh = 0.7f;
@@ -696,7 +697,7 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             float saturated = clean;
             saturated = processFETSaturation         (saturated, 1.0f);   // pełny drive=1
             saturated = processAsymmetricClip        (saturated, 0.5f);
-            saturated = processTransformerSaturation (saturated, 0.3f, channel);
+            saturated = processTransformerSaturation (saturated, 0.5f, channel);
 
             // HARMONICS: różnica saturowanego od czystego = czysty content harmonik
             // (bez fundamentalnej).  Wszystkie LF artefakty wspólne dla obu
