@@ -107,6 +107,23 @@ private:
     float detectorLPFCoeff   = 0.0f;
 
     // ─────────────────────────────────────────────────────────────────────
+    //  SIDE-CHAIN HPF na detektorze.
+    //
+    //  Klasyczna technika w 1176-style: detektor "nie widzi" basu (kompresor
+    //  ignoruje LF), więc nie pompuje na bębnie kicka ani basie.  To również
+    //  eliminuje sidebands modulacyjne w paśmie LF - bo gain reduction
+    //  zmienia się TYLKO w odpowiedzi na sygnał > 80 Hz, niskie pasma
+    //  fundamentalnej (np. 60 Hz) nie wywołują modulacji.
+    //
+    //  Biquad HPF 2-pole, fc ≈ 80 Hz, Q ≈ 0.707.
+    //  Filtr działa TYLKO na sygnale detekcji, NIE na audio path.
+    // ─────────────────────────────────────────────────────────────────────
+    float scHpfB0 = 1.0f, scHpfB1 = 0.0f, scHpfB2 = 0.0f;
+    float scHpfA1 = 0.0f, scHpfA2 = 0.0f;
+    float scHpfX1 = 0.0f, scHpfX2 = 0.0f;
+    float scHpfY1 = 0.0f, scHpfY2 = 0.0f;
+
+    // ─────────────────────────────────────────────────────────────────────
     //  TRANSFORMER DC COMPENSATION (per kanał)
     //  Krzywa Carnhilla y = x + α·x² produkuje 2nd harmonic + ZMIENNY W CZASIE
     //  DC offset (proporcjonalny do <x²> czyli mocy sygnału).  Klasyczny DC

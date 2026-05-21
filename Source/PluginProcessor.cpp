@@ -25,7 +25,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ABI1176Processor::createPara
             })));
 
     params.push_back(std::make_unique<juce::AudioParameterFloat>("drive", "Drive",
-        juce::NormalisableRange<float>(0.0f, 1.0f, 0.01f), 0.5f));
+        juce::NormalisableRange<float>(0.0f, 1.5f, 0.01f), 0.5f));
 
     params.push_back(std::make_unique<juce::AudioParameterFloat>("outputGain", "Output Gain",
         gainRange, 0.0f,
@@ -42,7 +42,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ABI1176Processor::createPara
     params.push_back(std::make_unique<juce::AudioParameterBool>("compMode", "Mode (Smooth)", false));
     params.push_back(std::make_unique<juce::AudioParameterBool>("character", "Character (Nuke)", false));
     params.push_back(std::make_unique<juce::AudioParameterBool>("zeroLat", "Zero Latency", false));
-    params.push_back(std::make_unique<juce::AudioParameterBool>("fat", "FAT (x8)", false));
+    params.push_back(std::make_unique<juce::AudioParameterBool>("fat", "FAT (x16)", false));
     return { params.begin(), params.end() };
 }
 
@@ -93,8 +93,10 @@ void ABI1176Processor::updateOversampling()
     const bool useZeroLat = zeroLatParam->load() > 0.5f;
     const bool useFat     = fatParam->load()     > 0.5f;
 
-    // FAT = x8 (faktor 3, bo 2^3=8), normalny = x4 (faktor 2)
-    const int factor = useFat ? 3 : 2;
+    // FAT = x16 (faktor 4, bo 2^4=16), normalny = x4 (faktor 2)
+    // x16 daje ekstremalnie dobre tłumienie aliasingu (potrzebne przy mocnym
+    // saturatorze i wielu harmonicznych), kosztem ~4× więcej CPU vs x4.
+    const int factor = useFat ? 4 : 2;
 
     // ZeroLat -> IIR halfband (krótka latencja faktyczna, ale faza nie jest liniowa)
     // Normalny -> FIR equiripple (lepsze tłumienie aliasingu kosztem latencji)
@@ -198,6 +200,25 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
         detectorLPF      = 0.0f;
     }
 
+    // Side-chain HPF biquad 2-pole (80 Hz, Q=0.707) - RBJ formula.
+    // Tłumi bas w torze DETEKTORA (audio path nie tknięty), eliminując
+    // pompowanie basowe i sidebands modulacyjne w paśmie LF.
+    {
+        const float fc    = 80.0f;
+        const float Q     = 0.707f;
+        const float w0    = 2.0f * juce::MathConstants<float>::pi * fc / static_cast<float> (osRate);
+        const float cosw  = std::cos (w0);
+        const float sinw  = std::sin (w0);
+        const float alpha = sinw / (2.0f * Q);
+        const float a0    = 1.0f + alpha;
+        scHpfB0 =  (1.0f + cosw) / 2.0f / a0;
+        scHpfB1 = -(1.0f + cosw) / a0;
+        scHpfB2 =  (1.0f + cosw) / 2.0f / a0;
+        scHpfA1 = -2.0f * cosw / a0;
+        scHpfA2 =  (1.0f - alpha) / a0;
+        scHpfX1 = scHpfX2 = scHpfY1 = scHpfY2 = 0.0f;
+    }
+
     // Transformer DC compensation LPF (~50 Hz) - dla aktywnej kompensacji
     // DC offsetu wewnątrz Carnhill x²-saturatora.  Patrz komentarz w
     // processTransformerSaturation.
@@ -226,15 +247,13 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
     spec.numChannels      = 2;
 
     // Tor wyjściowy - emulacja transformatora Carnhill (Neve-style):
-    //  - 1) HPF 20 Hz, Q=0.707 - DC-block + tłumienie infrasonic artifacts
-    //       (podniesione z 15 Hz, by skutecznie odciąć modulacyjne produkty < 20 Hz
-    //        powstające przy szybkiej kompresji nisko częstotliwościowego sygnału)
+    //  - 1) HPF 30 Hz, Q=0.707 - 2-pole / 12 dB/oktawa - skutecznie odcina
+    //       infrasonic artefakty z modulacji envelope kompresora (dawniej 1-pole
+    //       6 dB/okt nie tłumił wystarczająco pasma 30-100 Hz, gdzie generowały
+    //       się sidebands modulacyjne).
     //  - 2) Low-shelf 120 Hz, +1.5 dB, Q=0.7 - delikatna "warmth" Carnhilla
-    //       (zmniejszone z +3 dB / 100 Hz - +3 dB wzmacniało sub-bass artefakty
-    //        z modulacji envelope follower; +1.5 dB wystarcza dla charakteru)
-    //  - 3) High-shelf 12 kHz, -1.2 dB, Q=0.7 - bardzo łagodny "air" roll-off
-    //       (przesunięte z 10 kHz - Carnhill zachowuje air lepiej niż Lundahl)
-    filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass  (osRate, 20.0f);
+    //  - 3) High-shelf 12 kHz, -1.2 dB, Q=0.7 - łagodny "air" roll-off
+    filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass  (osRate, 30.0f, 0.707f);
     filterChain.get<1>().state = juce::dsp::IIR::Coefficients<float>::makeLowShelf  (osRate, 120.0f, 0.7f, juce::Decibels::decibelsToGain (1.5f));
     filterChain.get<2>().state = juce::dsp::IIR::Coefficients<float>::makeHighShelf (osRate, 12000.0f, 0.7f, juce::Decibels::decibelsToGain (-1.2f));
     filterChain.prepare (spec);
@@ -273,32 +292,25 @@ float ABI1176Processor::processFETSaturation (float sample, float drive)
 {
     // FET cut-off charakteristic (2N3819 w 1176 GR-stage).
     //
+    // W nowej topologii (parallel saturation) ta funkcja jest wywoływana z
+    // STAŁYM drive=1.0 jako "referencja pełnej saturacji".  Sam parametr drive
+    // jest zachowany w sygnaturze dla kompatybilności, ale wewnętrzny 'gain'
+    // jest stały (0.8) by zapewnić wyraźne harmoniki dla parallel-mix.
+    //
     // Topologia: ASYMETRYCZNY SATURATOR  x → x / (1 + |x|·k).  Fizyczny model
     // FET-a w stanie cut-off (drain-source nasyca się asymptotycznie).
-    // Generuje pełną serię NIEPARZYSTYCH harmonik (3rd, 5th, 7th, 9th, ...)
-    // z bardzo wolno spadającą obwiednią ≈ 1/n²  -  dokładnie jak prawdziwy
-    // 1176 i UAD-1176.  Przy domyślnym drive 0.5 dostajemy 15+ czystych
-    // harmonik (do 4 kHz dla sinusa 260 Hz) z naturalnym spadkiem.
+    // Generuje pełną serię NIEPARZYSTYCH harmonik (3rd, 5th, 7th, 9th, ...).
     //
     // KRYTYCZNE: funkcja jest IDEALNIE SYMETRYCZNA (nieparzysta).  Każde
     // wprowadzenie asymetrii (bias DC, asymetryczne knee) NATYCHMIAST
-    // produkuje silne parzyste harmoniki (H2, H4) które ZAGŁUSZAJĄ nieparzyste.
-    // To było źródłem alternacji H2 > H3 w starszych wersjach pluginu.
-    //
-    // Charakter Carnhilla (2nd order content) wprowadzamy WYŁĄCZNIE
-    // w processTransformerSaturation, w bardzo kontrolowany sposób.
-    //
-    // Sygnały podprogowe przechodzą prawie bez zniekształceń - unity gain
-    // dla małych x dzięki normalizacji przez 'gain' (pochodna w 0 = 1).
-    const float gain      = 0.30f + drive * 0.50f;       // 0.30 .. 0.80
-    const float satCoeff  = 0.5f;                        // ostrość kolana
+    // produkuje parzyste harmoniki dominujące nad nieparzystymi.  2nd order
+    // content (Carnhill) dodajemy WYŁĄCZNIE w processTransformerSaturation.
+    juce::ignoreUnused (drive);
+    const float gain      = 0.80f;        // stały gain (bo drive nie skaluje saturacji)
+    const float satCoeff  = 0.5f;
 
     const float x = sample * gain;
 
-    // Asymetryczny saturator - SYMETRYCZNY względem zera.
-    // Dla x>=0:  y = x / (1 + x*k)
-    // Dla x<0:   y = x / (1 - x*k)  = x / (1 + |x|*k)
-    // Czyli niezależnie od znaku:  |y| = |x| / (1 + |x|*k)
     float y;
     if (x >= 0.0f)  y = x / (1.0f + x * satCoeff);
     else            y = x / (1.0f - x * satCoeff);
@@ -402,7 +414,7 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         spec.sampleRate       = osRate;
         spec.maximumBlockSize = static_cast<juce::uint32> (currentSamplesPerBlock * oversampler->getOversamplingFactor());
         spec.numChannels      = 2;
-        filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass  (osRate, 20.0f);
+        filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass  (osRate, 30.0f, 0.707f);
         filterChain.get<1>().state = juce::dsp::IIR::Coefficients<float>::makeLowShelf  (osRate, 120.0f, 0.7f, juce::Decibels::decibelsToGain (1.5f));
         filterChain.get<2>().state = juce::dsp::IIR::Coefficients<float>::makeHighShelf (osRate, 12000.0f, 0.7f, juce::Decibels::decibelsToGain (-1.2f));
         filterChain.prepare (spec);
@@ -428,6 +440,22 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             const float dt = 1.0f / static_cast<float> (osRate);
             detectorLPFCoeff = dt / (rc + dt);
             detectorLPF      = 0.0f;
+        }
+        // Side-chain HPF - przelicz dla nowego osRate
+        {
+            const float fc    = 80.0f;
+            const float Q     = 0.707f;
+            const float w0    = 2.0f * juce::MathConstants<float>::pi * fc / static_cast<float> (osRate);
+            const float cosw  = std::cos (w0);
+            const float sinw  = std::sin (w0);
+            const float alpha = sinw / (2.0f * Q);
+            const float a0    = 1.0f + alpha;
+            scHpfB0 =  (1.0f + cosw) / 2.0f / a0;
+            scHpfB1 = -(1.0f + cosw) / a0;
+            scHpfB2 =  (1.0f + cosw) / 2.0f / a0;
+            scHpfA1 = -2.0f * cosw / a0;
+            scHpfA2 =  (1.0f - alpha) / a0;
+            scHpfX1 = scHpfX2 = scHpfY1 = scHpfY2 = 0.0f;
         }
         {
             const float fc = 50.0f;
@@ -488,6 +516,7 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         // skompresowanego sygnału, gdy plugin wraca z bypassu
         detectorLPF       = 0.0f;
         transformerDCEst[0] = transformerDCEst[1] = 0.0f;
+        scHpfX1 = scHpfX2 = scHpfY1 = scHpfY2 = 0.0f;
         dcBlockX1[0] = dcBlockX1[1] = 0.0f;
         dcBlockY1[0] = dcBlockY1[1] = 0.0f;
         resetDryDelay();
@@ -547,6 +576,42 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     //    NUKE OFF -> ratio sterowany przez 'drive' (≈ 4:1 do ≈ 20:1)
     //    NUKE ON  -> BRICKWALL (∞:1) - emulacja "all-buttons-in" / British Mode
     //
+    // ─── 4. Kompresja w przestrzeni oversamplowanej ──────────────────────────
+    //
+    // ARCHITEKTURA v2 (rewriting po feedback od użytkownika):
+    //
+    // 1) Ratio jest STAŁE = 8:1 (NUKE off) lub ∞:1 brickwall (NUKE on).
+    //    Drive NIE wpływa na ratio kompresji.
+    //
+    // 2) Drive kontroluje WYŁĄCZNIE głośność harmonik, nie fundamentalnej.
+    //    Implementacja: parallel saturation path.
+    //
+    //         clean      = input * inputGain * gr                  (czysty wet)
+    //         saturated  = saturate(clean)                         (z harmonikami)
+    //         harmonics  = saturated - clean                       (TYLKO harmoniki)
+    //         output_wet = clean + harmonics * drive
+    //
+    //    Drive = 0   → output = clean (zerowe harmoniki, czysta kompresja)
+    //    Drive = 1   → output = saturated (pełna saturacja)
+    //    Drive = 0.5 → harmoniki na połowie głośności
+    //
+    //    KLUCZOWE: różnica `saturated - clean` znosi wzajemnie wszystkie LF
+    //    artefakty wspólne dla obu sygnałów (modulacja envelope, DC drift od
+    //    transformera).  To eliminuje "garb LF" widoczny w obu trybach.
+    //
+    // 3) Topologia FF/FB (SMOOTH on = FB) bez zmian.
+    //
+    // 4) Hard clip realizujemy DOPIERO PO output_gain, w pętli mix (krok 7).
+    //    Dzięki temu OUTPUT może podbić sygnał, ale nigdy nie przekroczy 0 dBFS.
+
+    const float threshold = 0.25f;                    // -12 dBFS
+    const float ratioConst = 8.0f;                    // STAŁE ratio 8:1 (jak w 1176 "8")
+    // Krzywa GR dla ratio R:1 powyżej progu:
+    //   output_level = threshold + (input_level - threshold) / R
+    //   gr = output_level / input_level
+    //      = (threshold + (env - threshold)/R) / env
+    // Dla env=threshold gr=1, dla env→∞ gr→1/R (asymptota 8:1).
+
     for (int sample = 0; sample < osSamples; ++sample)
     {
         const float inputGain = inputGainSmooth.getNextValue();
@@ -558,26 +623,39 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             det += std::abs (oversampledBlock.getSample (channel, sample)) * inputGain;
         if (totalNumInputChannels > 1) det *= 0.5f;
 
-        // ── Pre-detector LPF ────────────────────────────────────────────────
-        // Prostowany |x| dla sinusa f Hz to DC + harmoniczne parzyste (2f, 4f, ...).
-        // Bez filtru envelope follower oscyluje z 2f, modulując gain i wytwarzając
-        // inter-modulacyjne produkty (artefakty sub-bass).  RC LPF (~25 Hz) usuwa
-        // audio-rate ripple zostawiając tylko makro-envelope - dokładnie tak, jak
-        // fizyczny kondensator detektora w prawdziwym 1176.
+        // ── Side-chain HPF (80 Hz, 2-pole) ──────────────────────────────────
+        // Tłumi bas w torze DETEKTORA - kompresor "nie widzi" sygnałów < 80 Hz.
+        // Efekty:
+        //   1) Brak pompowania od kicka/basu (klasyczna technika 1176)
+        //   2) Sidebands modulacyjne LF (od mnożenia signal*gr) są minimalne
+        //      bo gr zmienia się TYLKO w odpowiedzi na pasma > 80 Hz
+        //   3) Audio path NIE jest tknięty - SC HPF jest tylko w detektorze
+        {
+            const float scIn  = det;
+            const float scOut = scHpfB0 * scIn
+                              + scHpfB1 * scHpfX1
+                              + scHpfB2 * scHpfX2
+                              - scHpfA1 * scHpfY1
+                              - scHpfA2 * scHpfY2;
+            scHpfX2 = scHpfX1; scHpfX1 = scIn;
+            scHpfY2 = scHpfY1; scHpfY1 = scOut;
+            det = std::abs (scOut);   // ponowne prostowanie po HPF
+        }
+
+        // ── Pre-detector LPF (~25 Hz) ───────────────────────────────────────
+        // Usuwa audio-rate ripple z prostowanego sygnału, dokładnie jak fizyczny
+        // kondensator detektora w prawdziwym 1176.  Bez tego envelope follower
+        // oscyluje z 2f0 i moduluje gain w paśmie audio.
         detectorLPF += detectorLPFCoeff * (det - detectorLPF);
         const float detSmoothed = detectorLPF;
 
         // SMOOTH = feedback (sygnał detekcji * aktualne GR -> "po GR")
         // Bez SMOOTH = feedforward (czysty sygnał wejściowy do detektora)
         //
-        // UWAGA: NIE używamy dodatkowego LPF na lastGainReduction.  Próbowaliśmy
-        // tego ("feedbackLPF" 100 Hz) by stłumić ripple modulacji gain - okazało
-        // się jednak, że LPF wprowadzał OPÓŹNIENIE w pętli sprzężenia zwrotnego,
-        // co przy wysokim drive i wysokim input gain destabilizowało pętlę
-        // i prowadziło do samowzbudzania (efekt "wycia" zgłaszany przez beta
-        // testera).  W prawdziwym 1176 sprzężenie jest natychmiastowe - tak też
-        // robimy tutaj.  Ripple na lastGainReduction jest już ograniczone przez
-        // pre-detector LPF, więc artefakty modulacyjne pozostają poniżej -100 dB.
+        // UWAGA: NIE używamy LPF na lastGainReduction (testowane wcześniej -
+        // wprowadzał opóźnienie w pętli sprzężenia, destabilizował pętlę i
+        // powodował "wycie" przy wysokim drive).  W prawdziwym 1176 sprzężenie
+        // jest natychmiastowe.
         const float detIn = isSmoothMode ? detSmoothed * lastGainReduction
                                          : detSmoothed;
 
@@ -587,34 +665,52 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         else
             envFollower = releaseCoeff * envFollower + (1.0f - releaseCoeff) * detIn;
 
-        // Krzywa GR - próg 0.25 (-12 dBFS), ratio sterowany przez 'drive'.
-        // NUKE = brickwall (∞:1): wyjście jest TWARDO klamrowane do progu.
-        //   Dla envFollower > threshold:  gr = threshold / envFollower
-        //   => output = input * gr = (input/inputGain) * (threshold/envFollower)
-        //              ≈ threshold (gdy envFollower ≈ inputGain*|sample|)
+        // ── Krzywa GR: stałe 8:1 lub brickwall ──────────────────────────────
         float gr = 1.0f;
-        if (envFollower > 0.25f)
+        if (envFollower > threshold)
         {
-            gr = isNukeMode
-                ? (0.25f / envFollower)
-                : (1.0f / (1.0f + (envFollower - 0.25f) * 15.0f * drive));
+            if (isNukeMode)
+            {
+                // Brickwall: wyjście klamrowane do threshold
+                gr = threshold / envFollower;
+            }
+            else
+            {
+                // Ratio 8:1: output_level = threshold + (env - threshold)/8
+                const float outLevel = threshold + (envFollower - threshold) / ratioConst;
+                gr = outLevel / envFollower;
+            }
         }
         lastGainReduction = gr;
         if (gr < blockMinGR) blockMinGR = gr;
 
-        // Aplikacja GR + saturacje na każdym kanale
+        // ── Aplikacja GR + parallel saturation per kanał ────────────────────
         for (int channel = 0; channel < totalNumInputChannels; ++channel)
         {
-            float x = oversampledBlock.getSample (channel, sample) * inputGain * gr;
-            x = processFETSaturation         (x, drive);
-            x = processAsymmetricClip        (x, 0.5f);
-            x = processTransformerSaturation (x, 0.3f, channel);
+            // CLEAN: skompresowany sygnał bez saturacji.  To jest "fundamentalna"
+            // odniesienia - drive nigdy jej nie zmienia.
+            const float clean = oversampledBlock.getSample (channel, sample)
+                              * inputGain * gr;
 
-            // ── DC BLOCKER ───────────────────────────────────────────────────
-            // Asymetryczne nieliniowości w torze (FET asym + transformer asym)
-            // mogą wprowadzić resztkowy DC drift, który dla dynamicznego sygnału
-            // przejawia się jako infrasonic noise (< 20 Hz, falujący).
-            //   y[n] = x[n] - x[n-1] + R*y[n-1]    (R ≈ 0.997 @ 192 kHz osRate)
+            // SATURATED: pełny tor saturacji (FET → asym → transformer Carnhill).
+            float saturated = clean;
+            saturated = processFETSaturation         (saturated, 1.0f);   // pełny drive=1
+            saturated = processAsymmetricClip        (saturated, 0.5f);
+            saturated = processTransformerSaturation (saturated, 0.3f, channel);
+
+            // HARMONICS: różnica saturowanego od czystego = czysty content harmonik
+            // (bez fundamentalnej).  Wszystkie LF artefakty wspólne dla obu
+            // sygnałów (modulacja envelope, DC od transformera, etc.) są ZNOSZONE
+            // wzajemnie - to eliminuje "garb LF".
+            const float harmonics = saturated - clean;
+
+            // OUTPUT: czysty wet + skalowane harmoniki
+            float x = clean + harmonics * drive;
+
+            // ── DC BLOCKER (lekkie zabezpieczenie) ───────────────────────────
+            // Po parallel saturation DC offset jest już mały (różnica saturated-clean
+            // anuluje DC offset transformera), ale zostawiamy DC blocker jako
+            // dodatkowe zabezpieczenie przed dryftem.
             const int dcCh   = juce::jlimit (0, 1, channel);
             const float xIn  = x;
             const float yOut = xIn - dcBlockX1[dcCh] + dcBlockR * dcBlockY1[dcCh];
@@ -658,6 +754,20 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     // Naprawa: pobieramy dry z circular buffera, opóźnionego dokładnie tyle
     // ile wynosi latencja oversamplera.
     //
+    // HARD CLIP na 0 dBFS:
+    // Po zastosowaniu output_gain (które może być +24 dB) klamruje sygnał do
+    // ±1.0.  Tym samym OUTPUT może podbić wet sygnał, ale nigdy nie przekroczy
+    // poziomu 0 dBFS - chroni odbiorcę przed cyfrowym przesterowaniem.
+    //
+    // Hard clip jest aplikowany w PRZESTRZENI HOST RATE (po downsamplingu),
+    // co oznacza że może produkować aliasing dla bardzo gorących sygnałów.
+    // W praktyce sygnał wchodzący do hard clipa jest już bardzo blisko 0 dBFS
+    // (zazwyczaj kompresor go ogranicza), więc aliasing jest minimalny.
+    auto hardClip = [] (float x) -> float
+    {
+        return juce::jlimit (-1.0f, 1.0f, x);
+    };
+
     if (dryDelayLength > 0)
     {
         const int chCount = juce::jmin (totalNumInputChannels, (int) dryDelayBuf.size());
@@ -684,7 +794,9 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 const float wet    = buffer.getReadPointer (ch)[s];
                 const float active = (dry * (1.0f - m) + wet * m) * o;
                 // Crossfade między czystym dry (czyli to co było w bypass) a active
-                buffer.getWritePointer (ch)[s] = dry * (1.0f - xf) + active * xf;
+                const float mixed  = dry * (1.0f - xf) + active * xf;
+                // Hard clip na 0 dBFS - bezpiecznik przeciw cyfrowemu przesterowaniu
+                buffer.getWritePointer (ch)[s] = hardClip (mixed);
             }
             readPos = (readPos + 1) & dryDelayMask;
         }
@@ -707,7 +819,8 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 const float dry    = dryBuffer.getReadPointer (ch)[s];
                 const float wet    = buffer   .getReadPointer (ch)[s];
                 const float active = (dry * (1.0f - m) + wet * m) * o;
-                buffer.getWritePointer (ch)[s] = dry * (1.0f - xf) + active * xf;
+                const float mixed  = dry * (1.0f - xf) + active * xf;
+                buffer.getWritePointer (ch)[s] = hardClip (mixed);
             }
         }
     }
