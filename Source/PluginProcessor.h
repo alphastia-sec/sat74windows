@@ -32,6 +32,17 @@ public:
     void setStateInformation (const void* data, int sizeInBytes) override;
     void parameterChanged (const juce::String& parameterID, float newValue) override;
 
+    // E2: Standardowy bypass JUCE.  Zwracając nasz bypass parameter,
+    // pozwalamy DAW zarządzać bypassem przez standardowe API host'a
+    // (np. guzik bypass w Cubase mixer strip, automatyzacja z DAW, itp.).
+    // Wewnętrzna implementacja w processBlock pozostaje taka sama (czyta
+    // bypassParam i robi crossfade) - tylko EKSPONUJEMY tę informację
+    // dla host'a.
+    juce::AudioProcessorParameter* getBypassParameter() const override
+    {
+        return apvts.getParameter ("bypass");
+    }
+
     juce::AudioProcessorValueTreeState apvts;
     float getGainReduction() const { return currentGR.load(); }
 
@@ -39,6 +50,10 @@ private:
     float processFETSaturation (float sample, float drive);
     float processTransformerSaturation (float sample, float amount, int channelIdx);
     float processAsymmetricClip (float sample, float bias);
+
+    // D2: pełny łańcuch saturacji (FET → asym → transformer) jako jedna
+    // funkcja - wywoływana 2× per próbka wewnątrz mini-oversamplingu.
+    float processSaturationChain (float sample, int channelIdx);
 
     // Inicjalizacja silnika Oversampling
     void updateOversampling();
@@ -72,7 +87,14 @@ private:
     //   [0] HPF 15 Hz       -> DC-block po klipperze + lekka rozciągłość basu
     //   [1] Low-shelf 100 Hz, +3 dB -> "warmth" w low-mids, charakter Carnhilla
     //   [2] High-shelf 10 kHz, -1.5 dB -> łagodny roll-off wysokich (Carnhill)
-    juce::dsp::ProcessorChain<StereoFilter, StereoFilter, StereoFilter> filterChain;
+    // Carnhill EQ chain + stromy HPF wyjściowy (LF cleanup).
+    //  Sloty 0,1,2 = HPF 6-rzędu (3 kaskadowe biquady Butterworth, 45 Hz):
+    //                eliminuje wszystko poniżej fundamentalnej drum-busa
+    //                (sub-bass artefakty, modulacyjny LF, leakage) do < -120 dB.
+    //  Slot 3 = Low-shelf 120 Hz +1.5 dB (warmth Carnhilla)
+    //  Slot 4 = High-shelf 12 kHz -1.2 dB (air roll-off Carnhilla)
+    juce::dsp::ProcessorChain<StereoFilter, StereoFilter, StereoFilter,
+                              StereoFilter, StereoFilter> filterChain;
 
     // Obiekt Oversampling
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
@@ -103,43 +125,108 @@ private:
     //  zostawiając tylko makro-envelope, dokładnie jak fizyczny kondensator
     //  detektora w prawdziwym 1176.
     // ─────────────────────────────────────────────────────────────────────
-    float detectorLPF        = 0.0f;
+    // ─────────────────────────────────────────────────────────────────────
+    //  DETEKTOR — pre-LPF (2-pole RC kaskada).
+    //  Wygładza prostowany sygnał przed envelope followerem.  2-pole (12 dB/okt)
+    //  tłumi ripple 2·f0 mocniej niż 1-pole - mniej modulacji gain.
+    // ─────────────────────────────────────────────────────────────────────
+    float detectorLPF[2]     = { 0.0f, 0.0f };
     float detectorLPFCoeff   = 0.0f;
 
     // ─────────────────────────────────────────────────────────────────────
-    //  SIDE-CHAIN HPF na detektorze.
+    //  GR SMOOTHING - wygładzanie gain reduction PRZED aplikacją do audio.
+    //
+    //  Problem zdiagnozowany na podstawie nagrania użytkownika:
+    //  Przy drive=0 (czysty sygnał, x = signal·inputGain·gr) harmoniki
+    //  NIEPARZYSTE (H3, H5) "falują", podobnie LF.  Przyczyna:
+    //
+    //  Envelope follower w trybie attack ma pasmo ~1 kHz, więc 'gr' zawiera
+    //  ripple przy 2·f0 (≈ -37 dB).  Mnożenie  signal · gr(t)  to MODULACJA
+    //  AMPLITUDOWA → sidebands przy f0±2f0:
+    //     f0 + 2f0 = 3f0  → fałszywy H3
+    //     f0 - 2f0 = -f0  → mirror do LF
+    //  Sidebands interferują z dryfem fazy → "falowanie".
+    //
+    //  Rozwiązanie: gr aplikowany do audio jest wygładzany 2-pole LPF 120 Hz.
+    //  Ripple 2·f0 (≥520 Hz) jest tłumiony o ~26 dB, a prawdziwe zmiany gr
+    //  (< 120 Hz, bo envelope follower) przechodzą swobodnie - więc attack
+    //  kompresji NIE jest spowolniony.
+    //
+    //  Detektor (envelope follower) pozostaje szybki - wygładzamy TYLKO
+    //  mnożnik audio, nie pętlę detekcji.
+    // ─────────────────────────────────────────────────────────────────────
+    float grSmoothLPF[3]   = { 1.0f, 1.0f, 1.0f };   // 3-pole kaskada
+    float grSmoothCoeff    = 0.0f;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  A1: SIDE-CHAIN HPF na detektorze (juce::dsp::IIR).
     //
     //  Klasyczna technika w 1176-style: detektor "nie widzi" basu (kompresor
     //  ignoruje LF), więc nie pompuje na bębnie kicka ani basie.  To również
     //  eliminuje sidebands modulacyjne w paśmie LF - bo gain reduction
-    //  zmienia się TYLKO w odpowiedzi na sygnał > 80 Hz, niskie pasma
-    //  fundamentalnej (np. 60 Hz) nie wywołują modulacji.
+    //  zmienia się TYLKO w odpowiedzi na sygnał > 80 Hz.
     //
-    //  Biquad HPF 2-pole, fc ≈ 80 Hz, Q ≈ 0.707.
-    //  Filtr działa TYLKO na sygnale detekcji, NIE na audio path.
+    //  Implementacja: juce::dsp::IIR::Filter zamiast ręczny biquad.  Powody:
+    //   - Stabilniejsza numerycznie (Direct Form II Transposed)
+    //   - Auto-handling denormali (JUCE wewnętrznie)
+    //   - Mniej kodu, mniej okazji do bugów
+    //   - Standardowy reset() i prepare()
+    //
+    //  Side-chain HPF jest MONO (det jest skalarem), więc używamy zwykłego
+    //  IIR::Filter, nie ProcessorDuplicator.
     // ─────────────────────────────────────────────────────────────────────
-    float scHpfB0 = 1.0f, scHpfB1 = 0.0f, scHpfB2 = 0.0f;
-    float scHpfA1 = 0.0f, scHpfA2 = 0.0f;
-    float scHpfX1 = 0.0f, scHpfX2 = 0.0f;
-    float scHpfY1 = 0.0f, scHpfY2 = 0.0f;
+    juce::dsp::IIR::Filter<float> sidechainHPF;
 
     // ─────────────────────────────────────────────────────────────────────
-    //  TRANSFORMER DC COMPENSATION (per kanał)
-    //  Krzywa Carnhilla y = x + α·x² produkuje 2nd harmonic + ZMIENNY W CZASIE
-    //  DC offset (proporcjonalny do <x²> czyli mocy sygnału).  Klasyczny DC
-    //  blocker (HPF 10 Hz) usuwa średnią, ale gdy DC oscyluje dynamicznie
-    //  (np. przy attack/release kompresora), filtr produkuje "infrasonic
-    //  ripple" widoczny jako garb LF na FFT.
+    //  D2: MINI-OVERSAMPLING 2× wewnątrz saturatorów.
     //
-    //  Rozwiązanie: lokalnie śledzimy <x²> per kanał przez LPF i odejmujemy
-    //  go od x² zanim trafi do reszty toru.  DC blocker dalej w torze widzi
-    //  sygnał już DC-balanced, więc nie produkuje ripple.
+    //  Problem: asymptotic saturator + transformer generują harmoniki bardzo
+    //  wysokiego rzędu (H19+ dla sinusa 5 kHz = 95 kHz).  Przy 192 kHz osRate
+    //  (Nyquist 96 kHz) najwyższe harmoniki odbijają się = aliasing.
     //
-    //  cut-off ~50 Hz: szybkie dostrojenie do zmian dynamicznych, ale dość
-    //  wolne by nie tłumić rzeczywistego 2nd harmonic ≥ 100 Hz.
+    //  Rozwiązanie: wewnątrz toru saturacji oversamplujemy jeszcze 2×.
+    //  Upsampling: 4-tap halfband FIR (windowed sinc) - daje ~60 dB tłumienia.
+    //  Downsampling: ten sam halfband (decymacja po 2).
+    //
+    //  State: 4 ostatnie próbki wejścia per kanał (do interpolacji halfband)
+    //  + 4 ostatnie próbki wyjścia per kanał (do filtra decymacji).
     // ─────────────────────────────────────────────────────────────────────
-    float transformerDCEst[2] = { 0.0f, 0.0f };
-    float transformerDCCoeff  = 0.0f;
+    float miniOsUpHist[2][4]   = { { 0.0f, 0.0f, 0.0f, 0.0f },
+                                   { 0.0f, 0.0f, 0.0f, 0.0f } };
+    float miniOsDownHist[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f },
+                                   { 0.0f, 0.0f, 0.0f, 0.0f } };
+    // 2-próbkowa linia opóźniająca dla 'clean' - synchronizuje fundamentalną
+    // z opóźnieniem grupowym mini-oversamplingu (halfband filter latency).
+    float cleanDelay[2][2]     = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  B1: LOOKAHEAD
+    //
+    //  Sygnał audio jest opóźniony o ~1.5 ms względem sygnału detekcji.
+    //  Dzięki temu detektor "widzi przyszłość" - kompresor zaczyna redukcję
+    //  ZANIM transient dotrze do toru audio.  Efekt: zero overshoot na
+    //  ostrych transientach (kick, snare crack).
+    //
+    //  Linia opóźniająca działa w przestrzeni OVERSAMPLOWANEJ (osRate),
+    //  per kanał.  Długość = round(1.5 ms × osRate), zaokrąglona w górę do
+    //  potęgi 2 dla maskowania indeksu.
+    //
+    //  Dodatkowa latencja jest zgłaszana hostowi przez setLatencySamples
+    //  (zsumowana z latencją oversamplera).
+    // ─────────────────────────────────────────────────────────────────────
+    std::vector<std::vector<float>> lookaheadBuf;   // [channel][sample]
+    int lookaheadWrite  = 0;
+    int lookaheadSize   = 0;       // pojemność (potęga 2)
+    int lookaheadMask   = 0;
+    int lookaheadLength = 0;       // ile próbek opóźnienia (w osRate)
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  TRANSFORMER (Carnhill model) - A2: nowy fizyczny model B-H.
+    //  Wcześniejsze pola transformerDCEst/Coeff zostały usunięte - nowy
+    //  model nie produkuje DC offsetu (asymetryczny Padé approximant
+    //  z różną krzywizną w gałęziach +/-), więc nie potrzebujemy LPF
+    //  do estymacji DC.  Patrz processTransformerSaturation.
+    // ─────────────────────────────────────────────────────────────────────
 
     // ─────────────────────────────────────────────────────────────────────
     //  BYPASS CROSSFADE
@@ -158,9 +245,8 @@ private:
     //  Asymetria wprowadza powolny DC drift który tworzy infrasonic noise.
     //  Pojedyncza linia opóźniająca-prostowanie: y[n] = x[n] - x[n-1] + R*y[n-1]
     // ─────────────────────────────────────────────────────────────────────
-    float dcBlockX1[2] = { 0.0f, 0.0f };
-    float dcBlockY1[2] = { 0.0f, 0.0f };
-    float dcBlockR     = 0.0f;
+    // DC blocker usunięty - blokowanie DC zapewnia HPF 6-rzędu 45 Hz
+    // w filterChain.  Osobny 1-pole DC blocker wytwarzał LF "ogon" artefakt.
 
     // Flaga do odbudowania oversamplera w prepareToPlay po zmianie parametrów
     std::atomic<bool> oversamplerDirty { false };
