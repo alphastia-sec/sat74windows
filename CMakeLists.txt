@@ -3,7 +3,7 @@ project(SAT_76 VERSION 1.1.0)
 
 add_subdirectory(JUCE)
 
-juce_add_plugin(SAT_76
+juce_add_plugin(SAT_76)
     COMPANY_NAME "Alphastudio"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
