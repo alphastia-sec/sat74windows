@@ -1,7 +1,17 @@
 #pragma once
 #include <JuceHeader.h>
 
-using StereoFilter = juce::dsp::ProcessorDuplicator<juce::dsp::IIR::Filter<float>, juce::dsp::IIR::Coefficients<float>>;
+// Filtry tonowe (HPF 6-rzędu + shelfy Carnhill) używają stanu DOUBLE.
+//
+// Powód: biquady IIR o niskiej częstotliwości (HPF 45 Hz) mają biegun
+// bardzo blisko okręgu jednostkowego.  W arytmetyce float32 błąd
+// kwantyzacji akumuluje się w paśmie LF, dając szum rzędu -90..-100 dB.
+// Stan double (mantysa 52-bit zamiast 23-bit) spycha ten szum poniżej
+// -200 dB - całkowicie niesłyszalny i niewidoczny na FFT.
+//
+// Filtry pracują na host-rate (po downsamplingu), więc koszt CPU double
+// jest minimalny (tylko 5 biquadów × 2 kanały × host-rate).
+using StereoFilter = juce::dsp::ProcessorDuplicator<juce::dsp::IIR::Filter<double>, juce::dsp::IIR::Coefficients<double>>;
 
 class ABI1176Processor  : public juce::AudioProcessor,
                           public juce::AudioProcessorValueTreeState::Listener
@@ -17,7 +27,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override;
 
-    const juce::String getName() const override { return "DRUM SAT 76"; }
+    const juce::String getName() const override { return "SAT 76"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     double getTailLengthSeconds() const override { return 0.0; }
@@ -73,6 +83,7 @@ private:
     // Nowe parametry: Zero Latency i FAT
     std::atomic<float>* zeroLatParam    = nullptr;
     std::atomic<float>* fatParam        = nullptr;
+    std::atomic<float>* driftParam      = nullptr;
 
     std::atomic<float> currentGR { 0.0f };
     bool wasBypassed = true;
@@ -96,6 +107,11 @@ private:
     juce::dsp::ProcessorChain<StereoFilter, StereoFilter, StereoFilter,
                               StereoFilter, StereoFilter> filterChain;
 
+    // Bufor double dla filterChain - filtry mają stan double (precyzja LF),
+    // więc potrzebują bufora double.  Konwersja float→double→float odbywa
+    // się w kroku 6 processBlock.  Realokowany w prepareToPlay.
+    juce::AudioBuffer<double> filterChainBufferD;
+
     // Obiekt Oversampling
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
 
@@ -113,7 +129,24 @@ private:
     int currentSamplesPerBlock = 512;
     float envFollower  = 0.0f;
     float attackCoeff  = 0.0f;
-    float releaseCoeff = 0.0f;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  PROGRAM-DEPENDENT RELEASE
+    //
+    //  Prawdziwy 1176 ma release zależny od sygnału - krótkie transienty
+    //  puszcza szybko, długie pasaże wolno.  Modelujemy to dwiema stałymi
+    //  czasowymi (szybka ~60 ms, wolna ~400 ms) i zmienną 'releaseState'
+    //  (0..1), która rośnie podczas SUSTAINU (gdy envelope jest wysoki) i
+    //  opada w ciszy.  Im dłużej trwa sygnał, tym wyższy releaseState i tym
+    //  wolniejszy, gładszy release.  Krótki transient → niski releaseState
+    //  → szybkie puszczenie.  Efektywny współczynnik = lerp(fast, slow).
+    //  Daje "oddech" zamiast pompowania.
+    // ─────────────────────────────────────────────────────────────────────
+    float releaseCoeffFast = 0.0f;     // ~60 ms
+    float releaseCoeffSlow = 0.0f;     // ~400 ms
+    float relStateUp   = 0.0f;         // tempo narastania w sustainie (~200 ms)
+    float relStateDown = 0.0f;         // tempo opadania w ciszy (~80 ms)
+    float releaseState = 0.0f;         // 0 = faza szybka, 1 = faza wolna
 
     // ─────────────────────────────────────────────────────────────────────
     //  DETEKTOR — wygładzenie audio-rate tętnienia.
@@ -178,6 +211,49 @@ private:
     juce::dsp::IIR::Filter<float> sidechainHPF;
 
     // ─────────────────────────────────────────────────────────────────────
+    //  SIDECHAIN PRESENCE BUMP
+    //
+    //  Szerokie podbicie ~3.5 kHz w torze DETEKTORA (nie audio).  Sprawia,
+    //  że kompresor mocniej reaguje na atak werbla, talerzy i transienty
+    //  presence - klasyczny trik z analogowych emulacji, daje "snap".
+    //  Bell +4 dB, Q≈0.8.  Działa tylko na sygnale detekcji.
+    // ─────────────────────────────────────────────────────────────────────
+    juce::dsp::IIR::Filter<float> sidechainBump;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  HARMONICZNE ZALEŻNE OD PASMA (tilt na sygnale 'harmonics')
+    //
+    //  Prawdziwy rdzeń transformatora generuje więcej parzystych w dole
+    //  pasma, a gorzej przenosi (gładziej tłumi) wysokie częstotliwości.
+    //  Modelujemy to delikatnym tiltem nakładanym WYŁĄCZNIE na sygnał
+    //  harmonik (czysty sygnał pozostaje nietknięty):
+    //    - low-shelf  +2 dB @ 250 Hz  → tłustszy, pełniejszy dół
+    //    - high-shelf -3 dB @ 4 kHz   → czystsza, mniej szorstka góra
+    //  Każdy człon to biquad per kanał (stereo), w przestrzeni osRate.
+    // ─────────────────────────────────────────────────────────────────────
+    juce::dsp::IIR::Filter<float> harmTiltLow[2];    // low-shelf per kanał
+    juce::dsp::IIR::Filter<float> harmTiltHigh[2];   // high-shelf per kanał
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  DRIFT — analogowa niedoskonałość (przełącznik DRIFT)
+    //
+    //  Bardzo wolny, sub-Hz dryf modulujący wzmocnienie - ±0.1 dB.
+    //  Niesłyszalny wprost, ale usuwa "martwą" cyfrową statyczność i nadaje
+    //  brzmieniu organiczny charakter starzejącego się sprzętu.
+    //
+    //  Generator: suma trzech oscylatorów sinusoidalnych o niewspółmiernych
+    //  częstotliwościach (0.11 / 0.27 / 0.43 Hz).  Brak wspólnego okresu →
+    //  dryf nigdy się nie powtarza, brzmi naturalnie.
+    //
+    //  Dwa NIEZALEŻNE generatory (L i R) z lekko innymi częstotliwościami →
+    //  kanały odrobinę się rozjeżdżają → subtelna szerokość i "życie".
+    //
+    //  Drift jest aktualizowany raz na próbkę host-rate w pętli mix.
+    // ─────────────────────────────────────────────────────────────────────
+    float driftPhase[2][3] = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
+    float driftInc[2][3]   = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
+
+    // ─────────────────────────────────────────────────────────────────────
     //  D2: MINI-OVERSAMPLING 2× wewnątrz saturatorów.
     //
     //  Problem: asymptotic saturator + transformer generują harmoniki bardzo
@@ -198,6 +274,28 @@ private:
     // 2-próbkowa linia opóźniająca dla 'clean' - synchronizuje fundamentalną
     // z opóźnieniem grupowym mini-oversamplingu (halfband filter latency).
     float cleanDelay[2][2]     = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+
+    // DC-trap na sygnale 'harmonics' (per kanał).  Sygnał harmonik z definicji
+    // ma mieć średnią zero, ale asymetryczny transformator A2 wprowadza drobny
+    // DC offset (~-55 dB).  Przy drive>0 ten DC, modulowany wolnozmiennym
+    // satProportion, daje subsoniczny pik <10 Hz.  Estymator średniej 1-pole
+    // (5 Hz) odejmowany od harmonik usuwa DC nie tykając realnych harmonik
+    // (najniższa H2 to ≥80 Hz nawet dla basu).
+    float harmDCEst[2]         = { 0.0f, 0.0f };
+    float harmDCCoeff          = 0.0f;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  THD ROSNĄCE Z POZIOMEM
+    //
+    //  Saturacja zależy już od gain reduction (B5).  Dodajemy DRUGĄ
+    //  zależność - od poziomu sygnału wejściowego: transformator nasyca
+    //  się tym bardziej, im gorętszy sygnał.  'levelEnv' to wolna obwiednia
+    //  (~50 ms) poziomu wejścia; mapowana na 'levelDrive' 0..1, która
+    //  delikatnie zwiększa ilość harmonik niezależnie od kompresji.
+    //  Sprawia, że plugin "reaguje na granie".
+    // ─────────────────────────────────────────────────────────────────────
+    float levelEnv             = 0.0f;
+    float levelEnvCoeff        = 0.0f;
 
     // ─────────────────────────────────────────────────────────────────────
     //  B1: LOOKAHEAD

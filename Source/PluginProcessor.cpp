@@ -43,6 +43,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ABI1176Processor::createPara
     params.push_back(std::make_unique<juce::AudioParameterBool>("character", "Character (Nuke)", false));
     params.push_back(std::make_unique<juce::AudioParameterBool>("zeroLat", "Zero Latency", false));
     params.push_back(std::make_unique<juce::AudioParameterBool>("fat", "FAT (x16)", false));
+    params.push_back(std::make_unique<juce::AudioParameterBool>("drift", "Drift", false));
     return { params.begin(), params.end() };
 }
 
@@ -72,6 +73,7 @@ ABI1176Processor::ABI1176Processor()
     characterParam  = apvts.getRawParameterValue ("character");
     zeroLatParam    = apvts.getRawParameterValue ("zeroLat");
     fatParam        = apvts.getRawParameterValue ("fat");
+    driftParam      = apvts.getRawParameterValue ("drift");
 
     // KRYTYCZNE: rejestracja listenera. Bez tego parameterChanged nigdy się nie wywołuje
     // i oversampler nie reaguje na zmiany ZeroLat / FAT w trakcie playbacku.
@@ -206,10 +208,25 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // Stałe czasowe wg schematu UREI 1176 (Rev A "Blue Stripe"):
     //   Attack  : 20 us (najszybszy) ... 800 us (najwolniejszy)
     //   Release : 50 ms (najszybszy) ... 1100 ms (najwolniejszy)
-    // Dla drum-busa wybieramy środkowe, muzykalne wartości:
-    //   ~150 us attack / ~200 ms release - zostawia transjent, kontroluje sustain.
-    attackCoeff  = std::exp (-1.0f / (float (sampleRate) * 0.00015f));  // 150 us
-    releaseCoeff = std::exp (-1.0f / (float (sampleRate) * 0.20f));     // 200 ms
+    //
+    // KRYTYCZNE: envelope follower pracuje w pętli OVERSAMPLOWANEJ (osRate),
+    // więc współczynniki muszą być liczone z osRate, nie z host sampleRate -
+    // inaczej rzeczywiste czasy są factor× za krótkie.
+    //
+    // PROGRAM-DEPENDENT RELEASE: zamiast jednego release - dwie stałe czasowe.
+    //   fast ~60 ms  - dla krótkich transientów (szybkie puszczenie)
+    //   slow ~400 ms - dla długich, utrzymujących się pasaży (wolny, gładki)
+    // Efektywny release interpoluje między nimi wg 'releaseState'.
+    {
+        const double osR = currentSampleRate
+                          * static_cast<double> (oversampler->getOversamplingFactor());
+        attackCoeff       = std::exp (-1.0f / (float (osR) * 0.00015f));   // 150 us
+        releaseCoeffFast  = std::exp (-1.0f / (float (osR) * 0.060f));     // 60 ms
+        releaseCoeffSlow  = std::exp (-1.0f / (float (osR) * 0.400f));     // 400 ms
+        relStateUp        = std::exp (-1.0f / (float (osR) * 0.200f));     // narastanie 200 ms
+        relStateDown      = std::exp (-1.0f / (float (osR) * 0.080f));     // opadanie 80 ms
+        releaseState      = 0.0f;
+    }
 
     // osRate już policzony na początku funkcji - używamy lokalnej kopii.
 
@@ -238,6 +255,22 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
         grSmoothLPF[2]  = 1.0f;
     }
 
+    // DC-trap dla sygnału 'harmonics' - 1-pole estymator średniej, 5 Hz.
+    // Usuwa drobny DC offset transformatora (źródło subsonicznego piku <10 Hz).
+    {
+        const float fc = 5.0f;
+        harmDCCoeff   = 2.0f * juce::MathConstants<float>::pi * fc
+                        / static_cast<float> (osRate);
+        harmDCEst[0]  = 0.0f;
+        harmDCEst[1]  = 0.0f;
+    }
+
+    // Level follower dla THD rosnącego z poziomem - wolna obwiednia 50 ms.
+    {
+        levelEnvCoeff = std::exp (-1.0f / (float (osRate) * 0.050f));
+        levelEnv      = 0.0f;
+    }
+
     // A1: Side-chain HPF (juce::dsp::IIR, 2-pole, 80 Hz, Q=0.707).
     // Tłumi bas w torze DETEKTORA (audio path nie tknięty), eliminując
     // pompowanie basowe i sidebands modulacyjne w paśmie LF.
@@ -249,6 +282,33 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
         scSpec.numChannels      = 1;          // mono detektor
         sidechainHPF.prepare (scSpec);
         sidechainHPF.reset();
+
+        // Sidechain presence bump - bell +4 dB @ 3.5 kHz, Q≈0.8.
+        // Wzmacnia reakcję kompresora na atak werbla i talerzy.
+        sidechainBump.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+            osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (4.0f));
+        sidechainBump.prepare (scSpec);
+        sidechainBump.reset();
+    }
+
+    // Tilt harmonik (per kanał) - kształtuje pasmowo sygnał 'harmonics'.
+    // low-shelf +2 dB @ 250 Hz, high-shelf -3 dB @ 4 kHz.  W przestrzeni osRate.
+    {
+        juce::dsp::ProcessSpec htSpec;
+        htSpec.sampleRate       = osRate;
+        htSpec.maximumBlockSize = 1;
+        htSpec.numChannels      = 1;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
+                osRate, 250.0f, 0.7f, juce::Decibels::decibelsToGain (2.0f));
+            harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+                osRate, 4000.0f, 0.7f, juce::Decibels::decibelsToGain (-3.0f));
+            harmTiltLow[ch].prepare (htSpec);
+            harmTiltHigh[ch].prepare (htSpec);
+            harmTiltLow[ch].reset();
+            harmTiltHigh[ch].reset();
+        }
     }
 
     // A2: usunęliśmy transformerDC LPF - nowy fizyczny model transformera
@@ -259,33 +319,51 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // 6-rzędu 45 Hz w filterChain (poniżej).  Patrz komentarz w pętli
     // kompresji przy "BLOKOWANIE DC".
 
-    juce::dsp::ProcessSpec spec;
-    spec.sampleRate       = osRate;
-    spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock * oversampler->getOversamplingFactor());
-    spec.numChannels      = 2;
-
     // Tor wyjściowy - HPF 6-rzędu (LF cleanup) + emulacja Carnhill:
+    //  Pracuje na HOST-RATE (nie oversamplowanym) - patrz krok 6 w processBlock.
+    //  Powód: biquady IIR 45 Hz przy osRate 768 kHz mają biegun zbyt blisko
+    //  jednostki dla precyzji float32 → szum LF.  Host-rate to eliminuje.
     //
-    //  Sloty 0,1,2: HPF 6-rzędu Butterworth, cutoff 45 Hz.
-    //    6-rzędu = 3 kaskadowe biquady 2-rzędu o tym samym cutoff, różnych Q.
-    //    Wartości Q dla Butterworth 6-rzędu: 0.5176, 0.7071, 1.9319.
-    //    Tłumienie: -42 dB @ 20 Hz, -31 dB @ 25 Hz, 0.00 dB @ 260 Hz.
-    //    Eliminuje WSZYSTKO poniżej fundamentalnej drum-busa - sub-bass
-    //    artefakty, modulacyjny LF, leakage analizatora - poniżej -120 dB.
-    //    Cutoff 45 Hz jest bezpieczny dla drum-busa (kick ma fundament
-    //    50-60 Hz - nietknięty; odcinamy tylko niepożądany sub < 40 Hz).
-    //
-    //  Slot 3: Low-shelf 120 Hz, +1.5 dB - delikatna "warmth" Carnhilla
-    //  Slot 4: High-shelf 12 kHz, -1.2 dB - łagodny "air" roll-off Carnhilla
+    //  Sloty 0,1,2: HPF 6-rzędu Butterworth, cutoff 45 Hz (Q: 0.5176/0.7071/1.9319)
+    //  Slot 3: Low-shelf 120 Hz, +1.5 dB - "warmth" Carnhilla
+    //  Slot 4: High-shelf 12 kHz, -1.2 dB - "air" roll-off Carnhilla
     {
-        const float hpfFc = 45.0f;
-        filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 0.5176f);
-        filterChain.get<1>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 0.7071f);
-        filterChain.get<2>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 1.9319f);
+        juce::dsp::ProcessSpec hostSpec;
+        hostSpec.sampleRate       = sampleRate;          // HOST-RATE, nie osRate
+        hostSpec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
+        hostSpec.numChannels      = 2;
+
+        const double hpfFc = 45.0;
+        filterChain.get<0>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 0.5176);
+        filterChain.get<1>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 0.7071);
+        filterChain.get<2>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 1.9319);
+        filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (sampleRate, 120.0,   0.7, juce::Decibels::decibelsToGain (1.5));
+        filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (sampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
+        filterChain.prepare (hostSpec);
     }
-    filterChain.get<3>().state = juce::dsp::IIR::Coefficients<float>::makeLowShelf  (osRate, 120.0f, 0.7f, juce::Decibels::decibelsToGain (1.5f));
-    filterChain.get<4>().state = juce::dsp::IIR::Coefficients<float>::makeHighShelf (osRate, 12000.0f, 0.7f, juce::Decibels::decibelsToGain (-1.2f));
-    filterChain.prepare (spec);
+    // Bufor double dla filterChain.  Rozmiar 2× zadeklarowany blok - zapas
+    // na wypadek gdyby host dał większy blok niż samplesPerBlock (rzadkie,
+    // ale wtedy unikamy alokacji w wątku audio).
+    filterChainBufferD.setSize (2, juce::jmax (samplesPerBlock * 2, 64), false, false, true);
+
+    // Drift - generator wolnego sub-Hz dryfu (przełącznik DRIFT).
+    // Trzy oscylatory na kanał, niewspółmierne częstotliwości.  Kanał R
+    // ma lekko inne częstotliwości niż L → subtelna rozbieżność stereo.
+    // driftInc = przyrost fazy na próbkę host-rate (2π·f / sampleRate).
+    {
+        // Częstotliwości [Hz] - L i R odrobinę inne (rozjazd kanałów)
+        const float fL[3] = { 0.110f, 0.270f, 0.430f };
+        const float fR[3] = { 0.123f, 0.249f, 0.467f };
+        const float twoPi = 2.0f * juce::MathConstants<float>::pi;
+        for (int k = 0; k < 3; ++k)
+        {
+            driftInc[0][k] = twoPi * fL[k] / static_cast<float> (sampleRate);
+            driftInc[1][k] = twoPi * fR[k] / static_cast<float> (sampleRate);
+            // Fazy startowe rozsunięte - by od pierwszej próbki dryf był "w ruchu"
+            driftPhase[0][k] = twoPi * (0.13f * k);
+            driftPhase[1][k] = twoPi * (0.37f * k);
+        }
+    }
 
     // Crossfade length: 30 ms w sample rate hosta - długo dosyć by ukryć
     // wszystkie transienty filtrów i krótkich attacków, ale nie tak długo
@@ -456,22 +534,24 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     if (oversamplerDirty.exchange (false))
     {
         updateOversampling();
-        // Filtry chain trzeba przygotować na nowy rate
+        // Filtry chain - HOST-RATE (nie osRate!).  Przeniesione na host-rate
+        // by uniknąć błędu kwantyzacji float32 w biquadach LF przy 768 kHz.
         const double osRate = currentSampleRate * static_cast<double> (oversampler->getOversamplingFactor());
-        juce::dsp::ProcessSpec spec;
-        spec.sampleRate       = osRate;
-        spec.maximumBlockSize = static_cast<juce::uint32> (currentSamplesPerBlock * oversampler->getOversamplingFactor());
-        spec.numChannels      = 2;
         {
-            const float hpfFc = 45.0f;
-            filterChain.get<0>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 0.5176f);
-            filterChain.get<1>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 0.7071f);
-            filterChain.get<2>().state = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, hpfFc, 1.9319f);
+            juce::dsp::ProcessSpec hostSpec;
+            hostSpec.sampleRate       = currentSampleRate;     // HOST-RATE
+            hostSpec.maximumBlockSize = static_cast<juce::uint32> (currentSamplesPerBlock);
+            hostSpec.numChannels      = 2;
+
+            const double hpfFc = 45.0;
+            filterChain.get<0>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 0.5176);
+            filterChain.get<1>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 0.7071);
+            filterChain.get<2>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 1.9319);
+            filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (currentSampleRate, 120.0,   0.7, juce::Decibels::decibelsToGain (1.5));
+            filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (currentSampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
+            filterChain.prepare (hostSpec);
+            filterChain.reset();
         }
-        filterChain.get<3>().state = juce::dsp::IIR::Coefficients<float>::makeLowShelf  (osRate, 120.0f, 0.7f, juce::Decibels::decibelsToGain (1.5f));
-        filterChain.get<4>().state = juce::dsp::IIR::Coefficients<float>::makeHighShelf (osRate, 12000.0f, 0.7f, juce::Decibels::decibelsToGain (-1.2f));
-        filterChain.prepare (spec);
-        filterChain.reset();
 
         // Smoothery muszą znać nowy rate (osRate zmienił się o czynnik 2 przy
         // przełączeniu FAT, albo o latencję przy ZERO LAT) - inaczej rampy będą
@@ -505,19 +585,68 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             grSmoothLPF[1] = 1.0f;
             grSmoothLPF[2] = 1.0f;
         }
-        // Side-chain HPF - przelicz dla nowego osRate
+        // DC-trap harmonics - przelicz dla nowego osRate
         {
-            sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 80.0f, 0.707f);
+            const float fc = 5.0f;
+            harmDCCoeff  = 2.0f * juce::MathConstants<float>::pi * fc
+                           / static_cast<float> (osRate);
+            harmDCEst[0] = 0.0f;
+            harmDCEst[1] = 0.0f;
+        }
+        // Level follower - przelicz dla nowego osRate
+        {
+            levelEnvCoeff = std::exp (-1.0f / (float (osRate) * 0.050f));
+            levelEnv      = 0.0f;
+        }
+        // Side-chain HPF + presence bump - przelicz dla nowego osRate
+        {
             juce::dsp::ProcessSpec scSpec;
             scSpec.sampleRate       = osRate;
             scSpec.maximumBlockSize = 1;
             scSpec.numChannels      = 1;
+
+            sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 80.0f, 0.707f);
             sidechainHPF.prepare (scSpec);
             sidechainHPF.reset();
+
+            sidechainBump.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (4.0f));
+            sidechainBump.prepare (scSpec);
+            sidechainBump.reset();
+        }
+        // Tilt harmonik - przelicz dla nowego osRate
+        {
+            juce::dsp::ProcessSpec htSpec;
+            htSpec.sampleRate       = osRate;
+            htSpec.maximumBlockSize = 1;
+            htSpec.numChannels      = 1;
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
+                    osRate, 250.0f, 0.7f, juce::Decibels::decibelsToGain (2.0f));
+                harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+                    osRate, 4000.0f, 0.7f, juce::Decibels::decibelsToGain (-3.0f));
+                harmTiltLow[ch].prepare (htSpec);
+                harmTiltHigh[ch].prepare (htSpec);
+                harmTiltLow[ch].reset();
+                harmTiltHigh[ch].reset();
+            }
         }
         resetDryDelay();
         envFollower       = 0.0f;
         lastGainReduction = 1.0f;
+        // Envelope follower coeff - przelicz dla nowego osRate (FAT toggle
+        // zmienia osRate, więc czasy attack/release trzeba odświeżyć).
+        {
+            const double osR = currentSampleRate
+                              * static_cast<double> (oversampler->getOversamplingFactor());
+            attackCoeff       = std::exp (-1.0f / (float (osR) * 0.00015f));
+            releaseCoeffFast  = std::exp (-1.0f / (float (osR) * 0.060f));
+            releaseCoeffSlow  = std::exp (-1.0f / (float (osR) * 0.400f));
+            relStateUp        = std::exp (-1.0f / (float (osR) * 0.200f));
+            relStateDown      = std::exp (-1.0f / (float (osR) * 0.080f));
+            releaseState      = 0.0f;
+        }
         // Reset crossfade też - zmiana zeroLat/fat resetuje filtry i może
         // wytworzyć transient.  Crossfade go zamaskuje.
         crossfadeCounter  = crossfadeLength;
@@ -556,11 +685,20 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         oversampler->reset();
         envFollower       = 0.0f;
         lastGainReduction = 1.0f;
+        releaseState      = 0.0f;
         // Reset detektora - aby nie mieć "duchów" z poprzednio skompresowanego
         // sygnału, gdy plugin wraca z bypassu
         detectorLPF[0] = detectorLPF[1] = 0.0f;
         sidechainHPF.reset();
+        sidechainBump.reset();
+        levelEnv = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            harmTiltLow[ch].reset();
+            harmTiltHigh[ch].reset();
+        }
         grSmoothLPF[0] = grSmoothLPF[1] = grSmoothLPF[2] = 1.0f;
+        harmDCEst[0] = harmDCEst[1] = 0.0f;
         // D2: reset mini-oversampling state
         for (int c = 0; c < 2; ++c)
         {
@@ -656,7 +794,9 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     // 4) Hard clip realizujemy DOPIERO PO output_gain, w pętli mix (krok 7).
     //    Dzięki temu OUTPUT może podbić sygnał, ale nigdy nie przekroczy 0 dBFS.
 
-    const float threshold = 0.25f;                    // -12 dBFS
+    const float threshold = 0.07906f;                 // -22 dBFS (obniżony o 10 dB
+                                                       // względem -12 dBFS - kompresor
+                                                       // reaguje na cichszy sygnał)
     const float ratioConst = 8.0f;                    // STAŁE ratio 8:1 (jak w 1176 "8")
     // Krzywa GR dla ratio R:1 powyżej progu:
     //   output_level = threshold + (input_level - threshold) / R
@@ -697,12 +837,21 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         //   3) Audio path NIE jest tknięty - SC HPF jest tylko w detektorze
         det = std::abs (sidechainHPF.processSample (det));
 
+        // ── Sidechain presence bump (bell +4 dB @ 3.5 kHz) ──────────────────
+        // Podbija pasmo ataku w torze detekcji - kompresor mocniej reaguje
+        // na transienty werbla i talerzy.  Tor audio NIE jest tknięty.
+        det = std::abs (sidechainBump.processSample (det));
+
         // ── Pre-detector LPF (2-pole, ~25 Hz) ───────────────────────────────
         // Usuwa audio-rate ripple z prostowanego sygnału.  2-pole kaskada
         // (12 dB/okt) tłumi ripple 2·f0 mocniej niż 1-pole - mniej modulacji.
         detectorLPF[0] += detectorLPFCoeff * (det           - detectorLPF[0]);
         detectorLPF[1] += detectorLPFCoeff * (detectorLPF[0] - detectorLPF[1]);
         const float detSmoothed = detectorLPF[1];
+
+        // Level follower dla THD - wolna obwiednia poziomu wejścia (50 ms).
+        // Używana do delikatnego zwiększania harmonik wraz z poziomem.
+        levelEnv += (1.0f - levelEnvCoeff) * (detSmoothed - levelEnv);
 
         // SMOOTH = feedback (sygnał detekcji * aktualne GR -> "po GR")
         // Bez SMOOTH = feedforward (czysty sygnał wejściowy do detektora)
@@ -714,26 +863,74 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         const float detIn = isSmoothMode ? detSmoothed * lastGainReduction
                                          : detSmoothed;
 
-        // Envelope follower - dwustanowy attack/release
+        // Envelope follower - attack natychmiastowy, release PROGRAM-DEPENDENT.
+        //
+        // releaseState (0..1) steruje szybkością release: 0 = faza szybka
+        // (krótkie transienty), 1 = faza wolna (długie pasaże).
         if (detIn > envFollower)
-            envFollower = attackCoeff  * envFollower + (1.0f - attackCoeff)  * detIn;
+        {
+            // ATAK - envelope rośnie
+            envFollower = attackCoeff * envFollower + (1.0f - attackCoeff) * detIn;
+        }
         else
-            envFollower = releaseCoeff * envFollower + (1.0f - releaseCoeff) * detIn;
+        {
+            // RELEASE - efektywny współczynnik interpoluje fast↔slow wg
+            // releaseState (im dłużej trwał sygnał, tym wolniejszy release).
+            const float relCoeff = releaseCoeffFast
+                                  + (releaseCoeffSlow - releaseCoeffFast) * releaseState;
+            envFollower = relCoeff * envFollower + (1.0f - relCoeff) * detIn;
+        }
 
-        // ── Krzywa GR: stałe 8:1 lub brickwall ──────────────────────────────
+        // releaseState: rośnie podczas SUSTAINU (envelope wysoki = sygnał
+        // trwa), opada w ciszy.  Dzięki temu releaseState "pamięta" jak
+        // długo trwał sygnał - długi pasaż → wysoki stan → wolny release;
+        // krótki transient → niski stan → szybkie puszczenie.
+        if (envFollower > 0.01f)
+            releaseState = relStateUp   * releaseState + (1.0f - relStateUp);
+        else
+            releaseState = relStateDown * releaseState;
+
+        // ── Krzywa GR: SOFT KNEE 8:1 lub brickwall ──────────────────────────
+        //
+        // SOFT KNEE: zamiast twardego progu, kompresja narasta stopniowo
+        // w pasie 'kneeWidth' dB wokół progu.  Poniżej kolana - brak
+        // kompresji; powyżej - pełne ratio; w kolanie - kwadratowa
+        // interpolacja.  Daje płynne "wkradanie się" kompresji zamiast
+        // skokowego włączenia - bardziej muzykalne, szczególnie na perkusji.
         float gr = 1.0f;
-        if (envFollower > threshold)
+        if (envFollower > 1.0e-9f)
         {
             if (isNukeMode)
             {
-                // Brickwall: wyjście klamrowane do threshold
-                gr = threshold / envFollower;
+                // Brickwall: bez kolana - twardy ∞:1 (tryb ekstremalny)
+                if (envFollower > threshold)
+                    gr = threshold / envFollower;
             }
             else
             {
-                // Ratio 8:1: output_level = threshold + (env - threshold)/8
-                const float outLevel = threshold + (envFollower - threshold) / ratioConst;
-                gr = outLevel / envFollower;
+                // Soft knee w domenie dB.  kneeWidth = szerokość kolana.
+                constexpr float kneeWidth = 6.0f;          // dB
+                const float envDb  = juce::Decibels::gainToDecibels (envFollower);
+                const float thrDb  = juce::Decibels::gainToDecibels (threshold);
+                const float over   = envDb - thrDb;        // ile dB nad progiem
+                const float slope  = (1.0f / ratioConst) - 1.0f;  // < 0
+
+                float grDb;
+                if (over <= -kneeWidth * 0.5f)
+                {
+                    grDb = 0.0f;                            // poniżej kolana
+                }
+                else if (over >= kneeWidth * 0.5f)
+                {
+                    grDb = slope * over;                    // pełne ratio
+                }
+                else
+                {
+                    // Wewnątrz kolana - kwadratowe narastanie kompresji
+                    const float x = over + kneeWidth * 0.5f;   // 0..kneeWidth
+                    grDb = slope * x * x / (2.0f * kneeWidth);
+                }
+                gr = juce::Decibels::decibelsToGain (grDb);
             }
         }
         // lastGainReduction = SUROWE gr - używane w pętli feedback (SMOOTH).
@@ -769,7 +966,21 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         // Krzywa sqrt: pow(1-gr, 0.5) - szybko rośnie z niewielką kompresją,
         // ale nie eksploduje przy ekstremalnej.  Używamy grAudio (wygładzone)
         // by satProportion też nie miało ripple.
-        const float satProportion = std::sqrt (juce::jmax (0.0f, 1.0f - grAudio));
+        float satProportion = std::sqrt (juce::jmax (0.0f, 1.0f - grAudio));
+
+        // THD ROSNĄCE Z POZIOMEM: drugi, niezależny od kompresji wkład.
+        // Transformator nasyca się tym bardziej, im gorętszy sygnał.
+        // levelDrive: poziom wejścia mapowany -30 dBFS→0 ... -6 dBFS→1.
+        // Dodaje do saturacji do ~35% przy gorącym sygnale - subtelnie,
+        // tak by efekt "podążał za graniem" bez dominowania nad B5.
+        {
+            const float lvlDb     = juce::Decibels::gainToDecibels (
+                                        juce::jmax (levelEnv, 1.0e-6f));
+            const float levelDrive = juce::jlimit (0.0f, 1.0f,
+                                                   (lvlDb + 30.0f) / 24.0f);
+            satProportion = juce::jmin (1.0f,
+                                        satProportion + levelDrive * 0.35f);
+        }
 
         for (int channel = 0; channel < totalNumInputChannels; ++channel)
         {
@@ -848,9 +1059,30 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
 
             // HARMONICS: różnica saturowanego od czystego = czysty content harmonik
             // (bez fundamentalnej).  Wszystkie LF artefakty wspólne dla obu
-            // sygnałów (modulacja envelope, DC od transformera, etc.) są ZNOSZONE
-            // wzajemnie - to eliminuje "garb LF".
-            const float harmonics = saturated - clean;
+            // sygnałów (modulacja envelope, etc.) są ZNOSZONE wzajemnie.
+            float harmonics = saturated - clean;
+
+            // DC-TRAP na harmonics: asymetryczny transformator A2 wprowadza
+            // drobny DC offset do 'saturated', który nie znosi się z 'clean'
+            // (clean nie ma DC).  Ten DC, modulowany wolnozmiennym
+            // satProportion, dawał subsoniczny pik <10 Hz.  Estymujemy
+            // średnią harmonik (1-pole, 5 Hz) i odejmujemy ją - harmoniki
+            // muzyczne (H2 ≥ 80 Hz nawet dla basu) pozostają nietknięte.
+            {
+                const int dcCh = juce::jlimit (0, 1, channel);
+                harmDCEst[dcCh] += harmDCCoeff * (harmonics - harmDCEst[dcCh]);
+                harmonics       -= harmDCEst[dcCh];
+            }
+
+            // HARMONICZNE ZALEŻNE OD PASMA: tilt nakładany na sam sygnał
+            // harmonik (czysty sygnał nietknięty).  Low-shelf +2 dB @ 250 Hz
+            // daje tłustszy dół, high-shelf -3 dB @ 4 kHz - czystszą górę.
+            // Modeluje pasmowe zachowanie rdzenia transformatora.
+            {
+                const int tCh = juce::jlimit (0, 1, channel);
+                harmonics = harmTiltLow [tCh].processSample (harmonics);
+                harmonics = harmTiltHigh[tCh].processSample (harmonics);
+            }
 
             // OUTPUT: czysty wet + harmoniki skalowane przez drive ORAZ przez
             // satProportion (B5).  Drive = user control (0..1.5), satProportion
@@ -891,12 +1123,56 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     if (targetGR_dB > 0.0f)   targetGR_dB = 0.0f;
     currentGR.store (targetGR_dB);
 
-    // ─── 5. Tor toneshapingu (HPF + low-shelf) na rate oversamplowanym ──────
-    juce::dsp::ProcessContextReplacing<float> context (oversampledBlock);
-    filterChain.process (context);
-
-    // ─── 6. Downsampling - wynik trafia z powrotem do 'buffer' ──────────────
+    // ─── 5. Downsampling - wynik trafia z powrotem do 'buffer' ──────────────
     oversampler->processSamplesDown (inputBlock);
+
+    // ─── 6. Tor toneshapingu Carnhill - na HOST-RATE, w DOUBLE ─────────────
+    //
+    // KRYTYCZNA NAPRAWA (diagnoza ETAP 1+2):
+    // filterChain (HPF 6-rzędu + shelfy) był wcześniej w przestrzeni
+    // OVERSAMPLOWANEJ (do 768 kHz przy FAT x16).  Biquady IIR 45 Hz przy tak
+    // wysokim sample rate mają biegun ~1e-4 od okręgu jednostkowego.  W float32
+    // błąd kwantyzacji przekracza ten dystans → szum LF -45 dB na FFT.
+    //
+    // Naprawa dwuetapowa:
+    //  1) filtry przeniesione na host-rate (biegun dalej od jednostki)
+    //  2) stan filtrów + przetwarzanie w DOUBLE (mantysa 52-bit vs 23-bit)
+    //
+    // Efekt łączny: szum LF spychany poniżej -200 dB (z -45 dB).
+    //
+    // Konwersja float→double→float.  Koszt minimalny: 5 biquadów × 2 kanały
+    // na host-rate (nie oversamplowanym).
+    {
+        const int nCh = juce::jmin (totalNumInputChannels, 2);
+
+        // Zabezpieczenie: gdyby host dał blok większy niż w prepareToPlay
+        if (filterChainBufferD.getNumSamples() < numSamples)
+            filterChainBufferD.setSize (2, numSamples, false, false, true);
+
+        // float → double
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const float*  src = buffer.getReadPointer (ch);
+            double*       dst = filterChainBufferD.getWritePointer (ch);
+            for (int s = 0; s < numSamples; ++s)
+                dst[s] = static_cast<double> (src[s]);
+        }
+
+        // Filtracja w double
+        juce::dsp::AudioBlock<double> dBlock (filterChainBufferD.getArrayOfWritePointers(),
+                                              (size_t) nCh, (size_t) numSamples);
+        juce::dsp::ProcessContextReplacing<double> context (dBlock);
+        filterChain.process (context);
+
+        // double → float
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const double* src = filterChainBufferD.getReadPointer (ch);
+            float*        dst = buffer.getWritePointer (ch);
+            for (int s = 0; s < numSamples; ++s)
+                dst[s] = static_cast<float> (src[s]);
+        }
+    }
 
     // ─── 7. Mix + output gain + soft ceiling (D1) ────────────────────────────
     //
@@ -933,6 +1209,30 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         return sign * (knee + range * std::tanh (excess / range));
     };
 
+    // ── DRIFT — mnożnik analogowej niedoskonałości ──────────────────────────
+    // Zwraca mnożnik wzmocnienia bliski 1.0 (±0.1 dB), modulowany bardzo
+    // wolnym sub-Hz dryfem.  Aktualizuje fazy oscylatorów.  Gdy przełącznik
+    // DRIFT wyłączony - zwraca dokładnie 1.0 (zero wpływu, zero kosztu fazy).
+    const bool driftOn = driftParam->load() > 0.5f;
+    // ±0.1 dB w skali liniowej: 10^(0.1/20) ≈ 1.01158
+    constexpr float driftDepth = 0.01158f;
+    auto driftGain = [this, driftOn] (int ch) -> float
+    {
+        if (! driftOn) return 1.0f;
+        const int c = juce::jlimit (0, 1, ch);
+        // Suma trzech oscylatorów / 3 → wynik w zakresie -1..1
+        float d = 0.0f;
+        for (int k = 0; k < 3; ++k)
+        {
+            d += std::sin (driftPhase[c][k]);
+            driftPhase[c][k] += driftInc[c][k];
+            if (driftPhase[c][k] > 2.0f * juce::MathConstants<float>::pi)
+                driftPhase[c][k] -= 2.0f * juce::MathConstants<float>::pi;
+        }
+        d *= (1.0f / 3.0f);
+        return 1.0f + d * driftDepth;
+    };
+
     if (dryDelayLength > 0)
     {
         const int chCount = juce::jmin (totalNumInputChannels, (int) dryDelayBuf.size());
@@ -957,10 +1257,11 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             {
                 const float dry    = dryDelayBuf[(size_t) ch][(size_t) readPos];
                 const float wet    = buffer.getReadPointer (ch)[s];
-                const float active = (dry * (1.0f - m) + wet * m) * o;
+                // Drift: subtelny mnożnik analogowej niedoskonałości (±0.1 dB)
+                const float active = (dry * (1.0f - m) + wet * m) * o * driftGain (ch);
                 // Crossfade między czystym dry (czyli to co było w bypass) a active
                 const float mixed  = dry * (1.0f - xf) + active * xf;
-                // Hard clip na 0 dBFS - bezpiecznik przeciw cyfrowemu przesterowaniu
+                // Soft ceiling - bezpiecznik przeciw cyfrowemu przesterowaniu
                 buffer.getWritePointer (ch)[s] = softCeiling (mixed);
             }
             readPos = (readPos + 1) & dryDelayMask;
@@ -983,7 +1284,7 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             {
                 const float dry    = dryBuffer.getReadPointer (ch)[s];
                 const float wet    = buffer   .getReadPointer (ch)[s];
-                const float active = (dry * (1.0f - m) + wet * m) * o;
+                const float active = (dry * (1.0f - m) + wet * m) * o * driftGain (ch);
                 const float mixed  = dry * (1.0f - xf) + active * xf;
                 buffer.getWritePointer (ch)[s] = softCeiling (mixed);
             }
