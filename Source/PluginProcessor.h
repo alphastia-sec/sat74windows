@@ -94,18 +94,15 @@ private:
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> driveSmooth;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> mixSmooth;
 
-    // Tor toneshapingu - emulacja transformatora wyjściowego Carnhill (Neve-style):
-    //   [0] HPF 15 Hz       -> DC-block po klipperze + lekka rozciągłość basu
-    //   [1] Low-shelf 100 Hz, +3 dB -> "warmth" w low-mids, charakter Carnhilla
-    //   [2] High-shelf 10 kHz, -1.5 dB -> łagodny roll-off wysokich (Carnhill)
-    // Carnhill EQ chain + stromy HPF wyjściowy (LF cleanup).
-    //  Sloty 0,1,2 = HPF 6-rzędu (3 kaskadowe biquady Butterworth, 45 Hz):
-    //                eliminuje wszystko poniżej fundamentalnej drum-busa
-    //                (sub-bass artefakty, modulacyjny LF, leakage) do < -120 dB.
-    //  Slot 3 = Low-shelf 120 Hz +1.5 dB (warmth Carnhilla)
+    // Tor toneshapingu - emulacja transformatora wyjściowego Carnhill (Neve-style).
+    // Wszystkie filtry pracują na HOST-RATE (nie oversamplowanym) - double precision.
+    //  Sloty 0,1,2 = HPF 6-rzędu Butterworth, cutoff 30 Hz
+    //                (obniżony z 45 Hz - kick ma fundament 50-80 Hz który musi
+    //                 przejść swobodnie; 30 Hz odcina tylko rumble i DC)
+    //  Slot 3 = Low-shelf 80 Hz +3 dB (mięso stopy i basu - Carnhill warmth)
     //  Slot 4 = High-shelf 12 kHz -1.2 dB (air roll-off Carnhilla)
     juce::dsp::ProcessorChain<StereoFilter, StereoFilter, StereoFilter,
-                              StereoFilter, StereoFilter> filterChain;
+                              StereoFilter, StereoFilter, StereoFilter> filterChain;
 
     // Bufor double dla filterChain - filtry mają stan double (precyzja LF),
     // więc potrzebują bufora double.  Konwersja float→double→float odbywa
@@ -159,12 +156,14 @@ private:
     //  detektora w prawdziwym 1176.
     // ─────────────────────────────────────────────────────────────────────
     // ─────────────────────────────────────────────────────────────────────
-    //  DETEKTOR — pre-LPF (2-pole RC kaskada).
+    //  DETEKTOR — pre-LPF (2-pole RC kaskada, 25 Hz).
     //  Wygładza prostowany sygnał przed envelope followerem.  2-pole (12 dB/okt)
     //  tłumi ripple 2·f0 mocniej niż 1-pole - mniej modulacji gain.
+    //  Bez tego filtra envFollower reaguje na pełne ripple f0 → zbyt
+    //  agresywna kompresja kicka, brak mięsa w dolnym paśmie.
     // ─────────────────────────────────────────────────────────────────────
-    float detectorLPF[2]     = { 0.0f, 0.0f };
-    float detectorLPFCoeff   = 0.0f;
+    float detectorLPF[2] = { 0.0f, 0.0f };   // stan 2-pole RC (pole 1, pole 2)
+    float detectorLPFCoeff = 0.0f;            // coeff RC 25 Hz @ osRate
 
     // ─────────────────────────────────────────────────────────────────────
     //  GR SMOOTHING - wygładzanie gain reduction PRZED aplikacją do audio.
@@ -231,8 +230,8 @@ private:
     //    - high-shelf -3 dB @ 4 kHz   → czystsza, mniej szorstka góra
     //  Każdy człon to biquad per kanał (stereo), w przestrzeni osRate.
     // ─────────────────────────────────────────────────────────────────────
-    juce::dsp::IIR::Filter<float> harmTiltLow[2];    // low-shelf per kanał
-    juce::dsp::IIR::Filter<float> harmTiltHigh[2];   // high-shelf per kanał
+    juce::dsp::IIR::Filter<double> harmTiltLow[2];    // low-shelf per kanał (double - precyzja przy FAT)
+    juce::dsp::IIR::Filter<double> harmTiltHigh[2];   // high-shelf per kanał (double)
 
     // ─────────────────────────────────────────────────────────────────────
     //  DRIFT — analogowa niedoskonałość (przełącznik DRIFT)

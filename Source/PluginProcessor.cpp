@@ -25,7 +25,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout ABI1176Processor::createPara
             })));
 
     params.push_back(std::make_unique<juce::AudioParameterFloat>("drive", "Drive",
-        juce::NormalisableRange<float>(0.0f, 1.5f, 0.01f), 0.5f));
+        juce::NormalisableRange<float>(0.0f, 2.5f, 0.01f), 0.5f));
 
     params.push_back(std::make_unique<juce::AudioParameterFloat>("outputGain", "Output Gain",
         gainRange, 0.0f,
@@ -230,8 +230,8 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     // osRate już policzony na początku funkcji - używamy lokalnej kopii.
 
-    // Detector LPF — usuwa tętnienie audio-rate z prostowanego sygnału.
-    // 2-pole RC kaskada (12 dB/okt) - mocniej tłumi ripple 2·f0 niż 1-pole.
+    // Detektor pre-LPF (2-pole RC kaskada, 25 Hz @ osRate).
+    // Wygładza prostowany sygnał przed envelope followerem.
     {
         const float fc = 25.0f;
         const float rc = 1.0f / (2.0f * juce::MathConstants<float>::pi * fc);
@@ -275,7 +275,7 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // Tłumi bas w torze DETEKTORA (audio path nie tknięty), eliminując
     // pompowanie basowe i sidebands modulacyjne w paśmie LF.
     {
-        sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 80.0f, 0.707f);
+        sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 60.0f, 0.707f);
         juce::dsp::ProcessSpec scSpec;
         scSpec.sampleRate       = osRate;
         scSpec.maximumBlockSize = 1;          // przetwarzamy po jednej próbce
@@ -283,10 +283,13 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
         sidechainHPF.prepare (scSpec);
         sidechainHPF.reset();
 
-        // Sidechain presence bump - bell +4 dB @ 3.5 kHz, Q≈0.8.
-        // Wzmacnia reakcję kompresora na atak werbla i talerzy.
+        // Sidechain presence bump - bell +2 dB @ 3.5 kHz, Q≈0.8.
+        // Lekko wzmacnia reakcję kompresora na atak werbla i talerzy.
+        // Zmniejszone z +4 dB -> +2 dB: przy +4 dB kompresor za mocno
+        // reagował na high-mids, przez co kick był nieproporcjonalnie
+        // kompresowany i tracił mięso w paśmie 60-100 Hz.
         sidechainBump.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-            osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (4.0f));
+            osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (2.0f));
         sidechainBump.prepare (scSpec);
         sidechainBump.reset();
     }
@@ -300,10 +303,12 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
         htSpec.numChannels      = 1;
         for (int ch = 0; ch < 2; ++ch)
         {
-            harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
-                osRate, 250.0f, 0.7f, juce::Decibels::decibelsToGain (2.0f));
-            harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-                osRate, 4000.0f, 0.7f, juce::Decibels::decibelsToGain (-3.0f));
+            // DOUBLE - biquady LF przy FAT 768kHz mają biegun blisko jednostki;
+            // float32 dawał szum modulowany -> falująca trawka między harmonikami.
+            harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<double>::makeLowShelf (
+                osRate, 250.0, 0.7, juce::Decibels::decibelsToGain (2.0));
+            harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<double>::makeHighShelf (
+                osRate, 4000.0, 0.7, juce::Decibels::decibelsToGain (-3.0));
             harmTiltLow[ch].prepare (htSpec);
             harmTiltHigh[ch].prepare (htSpec);
             harmTiltLow[ch].reset();
@@ -321,24 +326,24 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     // Tor wyjściowy - HPF 6-rzędu (LF cleanup) + emulacja Carnhill:
     //  Pracuje na HOST-RATE (nie oversamplowanym) - patrz krok 6 w processBlock.
-    //  Powód: biquady IIR 45 Hz przy osRate 768 kHz mają biegun zbyt blisko
-    //  jednostki dla precyzji float32 → szum LF.  Host-rate to eliminuje.
     //
-    //  Sloty 0,1,2: HPF 6-rzędu Butterworth, cutoff 45 Hz (Q: 0.5176/0.7071/1.9319)
-    //  Slot 3: Low-shelf 120 Hz, +1.5 dB - "warmth" Carnhilla
-    //  Slot 4: High-shelf 12 kHz, -1.2 dB - "air" roll-off Carnhilla
+    //  Sloty 0,1,2: HPF 6-rzędu Butterworth, cutoff 30 Hz
+    //  Slot 3: Low-shelf  80 Hz, +4.5 dB - odbudowuje fundament kicka (60-100 Hz)
+    //  Slot 4: Bell      180 Hz, +2.5 dB, Q=1.2 - "ciepło" i "mięso" stopy
+    //  Slot 5: High-shelf 12 kHz, -1.2 dB - łagodny roll-off Carnhilla
     {
         juce::dsp::ProcessSpec hostSpec;
-        hostSpec.sampleRate       = sampleRate;          // HOST-RATE, nie osRate
+        hostSpec.sampleRate       = sampleRate;
         hostSpec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
         hostSpec.numChannels      = 2;
 
-        const double hpfFc = 45.0;
+        const double hpfFc = 30.0;
         filterChain.get<0>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 0.5176);
         filterChain.get<1>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 0.7071);
         filterChain.get<2>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (sampleRate, hpfFc, 1.9319);
-        filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (sampleRate, 120.0,   0.7, juce::Decibels::decibelsToGain (1.5));
-        filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (sampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
+        filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (sampleRate,  80.0, 0.7, juce::Decibels::decibelsToGain (4.5));
+        filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makePeakFilter (sampleRate, 180.0, 1.2, juce::Decibels::decibelsToGain (2.5));
+        filterChain.get<5>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (sampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
         filterChain.prepare (hostSpec);
     }
     // Bufor double dla filterChain.  Rozmiar 2× zadeklarowany blok - zapas
@@ -360,8 +365,8 @@ void ABI1176Processor::prepareToPlay (double sampleRate, int samplesPerBlock)
             driftInc[0][k] = twoPi * fL[k] / static_cast<float> (sampleRate);
             driftInc[1][k] = twoPi * fR[k] / static_cast<float> (sampleRate);
             // Fazy startowe rozsunięte - by od pierwszej próbki dryf był "w ruchu"
-            driftPhase[0][k] = twoPi * (0.13f * k);
-            driftPhase[1][k] = twoPi * (0.37f * k);
+            driftPhase[0][k] = twoPi * (0.13f * static_cast<float>(k));
+            driftPhase[1][k] = twoPi * (0.37f * static_cast<float>(k));
         }
     }
 
@@ -543,12 +548,13 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             hostSpec.maximumBlockSize = static_cast<juce::uint32> (currentSamplesPerBlock);
             hostSpec.numChannels      = 2;
 
-            const double hpfFc = 45.0;
+            const double hpfFc = 30.0;
             filterChain.get<0>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 0.5176);
             filterChain.get<1>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 0.7071);
             filterChain.get<2>().state = juce::dsp::IIR::Coefficients<double>::makeHighPass (currentSampleRate, hpfFc, 1.9319);
-            filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (currentSampleRate, 120.0,   0.7, juce::Decibels::decibelsToGain (1.5));
-            filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (currentSampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
+            filterChain.get<3>().state = juce::dsp::IIR::Coefficients<double>::makeLowShelf  (currentSampleRate,  80.0, 0.7, juce::Decibels::decibelsToGain (4.5));
+            filterChain.get<4>().state = juce::dsp::IIR::Coefficients<double>::makePeakFilter (currentSampleRate, 180.0, 1.2, juce::Decibels::decibelsToGain (2.5));
+            filterChain.get<5>().state = juce::dsp::IIR::Coefficients<double>::makeHighShelf (currentSampleRate, 12000.0, 0.7, juce::Decibels::decibelsToGain (-1.2));
             filterChain.prepare (hostSpec);
             filterChain.reset();
         }
@@ -566,7 +572,7 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         driveSmooth     .setCurrentAndTargetValue (driveParam->load());
         mixSmooth       .setCurrentAndTargetValue (mixParam->load() / 100.0f);
 
-        // Detector LPF i DC blocker zależne od OS rate — przelicz na nowo
+        // Detector LPF - przelicz dla nowego osRate
         {
             const float fc = 25.0f;
             const float rc = 1.0f / (2.0f * juce::MathConstants<float>::pi * fc);
@@ -605,12 +611,12 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             scSpec.maximumBlockSize = 1;
             scSpec.numChannels      = 1;
 
-            sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 80.0f, 0.707f);
+            sidechainHPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (osRate, 60.0f, 0.707f);
             sidechainHPF.prepare (scSpec);
             sidechainHPF.reset();
 
             sidechainBump.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-                osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (4.0f));
+                osRate, 3500.0f, 0.8f, juce::Decibels::decibelsToGain (2.0f));
             sidechainBump.prepare (scSpec);
             sidechainBump.reset();
         }
@@ -622,10 +628,10 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             htSpec.numChannels      = 1;
             for (int ch = 0; ch < 2; ++ch)
             {
-                harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf (
-                    osRate, 250.0f, 0.7f, juce::Decibels::decibelsToGain (2.0f));
-                harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-                    osRate, 4000.0f, 0.7f, juce::Decibels::decibelsToGain (-3.0f));
+                harmTiltLow[ch].coefficients = juce::dsp::IIR::Coefficients<double>::makeLowShelf (
+                    osRate, 250.0, 0.7, juce::Decibels::decibelsToGain (2.0));
+                harmTiltHigh[ch].coefficients = juce::dsp::IIR::Coefficients<double>::makeHighShelf (
+                    osRate, 4000.0, 0.7, juce::Decibels::decibelsToGain (-3.0));
                 harmTiltLow[ch].prepare (htSpec);
                 harmTiltHigh[ch].prepare (htSpec);
                 harmTiltLow[ch].reset();
@@ -842,16 +848,16 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         // na transienty werbla i talerzy.  Tor audio NIE jest tknięty.
         det = std::abs (sidechainBump.processSample (det));
 
-        // ── Pre-detector LPF (2-pole, ~25 Hz) ───────────────────────────────
-        // Usuwa audio-rate ripple z prostowanego sygnału.  2-pole kaskada
-        // (12 dB/okt) tłumi ripple 2·f0 mocniej niż 1-pole - mniej modulacji.
-        detectorLPF[0] += detectorLPFCoeff * (det           - detectorLPF[0]);
-        detectorLPF[1] += detectorLPFCoeff * (detectorLPF[0] - detectorLPF[1]);
-        const float detSmoothed = detectorLPF[1];
-
         // Level follower dla THD - wolna obwiednia poziomu wejścia (50 ms).
         // Używana do delikatnego zwiększania harmonik wraz z poziomem.
-        levelEnv += (1.0f - levelEnvCoeff) * (detSmoothed - levelEnv);
+        levelEnv += (1.0f - levelEnvCoeff) * (det - levelEnv);
+
+        // Detektor pre-LPF (2-pole RC, 25 Hz): wygładza prostowany sygnał
+        // przed envelope followerem.  Bez tego filtra envFollower reaguje
+        // na pełne ripple f0 → zbyt agresywna kompresja, brak mięsa w kicku.
+        detectorLPF[0] += detectorLPFCoeff * (det            - detectorLPF[0]);
+        detectorLPF[1] += detectorLPFCoeff * (detectorLPF[0] - detectorLPF[1]);
+        const float detSmoothed = detectorLPF[1];
 
         // SMOOTH = feedback (sygnał detekcji * aktualne GR -> "po GR")
         // Bez SMOOTH = feedforward (czysty sygnał wejściowy do detektora)
@@ -1077,15 +1083,18 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             // HARMONICZNE ZALEŻNE OD PASMA: tilt nakładany na sam sygnał
             // harmonik (czysty sygnał nietknięty).  Low-shelf +2 dB @ 250 Hz
             // daje tłustszy dół, high-shelf -3 dB @ 4 kHz - czystszą górę.
-            // Modeluje pasmowe zachowanie rdzenia transformatora.
+            // DOUBLE: biquady w float32 przy 768kHz (FAT) dawały szum między
+            // harmonikami modulowany przez drive → falująca trawka na FFT.
             {
                 const int tCh = juce::jlimit (0, 1, channel);
-                harmonics = harmTiltLow [tCh].processSample (harmonics);
-                harmonics = harmTiltHigh[tCh].processSample (harmonics);
+                double h = static_cast<double> (harmonics);
+                h = harmTiltLow [tCh].processSample (h);
+                h = harmTiltHigh[tCh].processSample (h);
+                harmonics = static_cast<float> (h);
             }
 
             // OUTPUT: czysty wet + harmoniki skalowane przez drive ORAZ przez
-            // satProportion (B5).  Drive = user control (0..1.5), satProportion
+            // satProportion (B5).  Drive = user control (0..2.5), satProportion
             // = automatyczne skalowanie zależne od aktualnego GR.
             float x = clean + harmonics * drive * satProportion;
 
