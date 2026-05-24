@@ -1,9 +1,8 @@
 [Setup]
 AppName=Alphastudio SAT 76
-AppVersion=1.1.0
+AppVersion=1.0.2
 AppPublisher=Alphastudio
 AppPublisherURL=https://www.alphastudio.com.pl
-AppSupportURL=https://www.alphastudio.com.pl
 DefaultDirName={commoncf64}\VST3\Alphastudio SAT 76.vst3
 DisableDirPage=yes
 OutputDir=.\
@@ -14,7 +13,7 @@ ArchitecturesInstallIn64BitMode=x64
 ArchitecturesAllowed=x64
 
 [Files]
-Source: "build\SAT_76_artefacts\Release\VST3\Alphastudio SAT 76.vst3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "build\*_artefacts\Release\VST3\Alphastudio SAT 76.vst3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Alphastudio SAT 76"; Filename: "{app}"
