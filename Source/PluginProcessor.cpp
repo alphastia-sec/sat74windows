@@ -146,9 +146,9 @@ void ABI1176Processor::updateOversampling()
 // ════════════════════════════════════════════════════════════════════════════
 //  Dry delay - circular buffer (potęga 2 dla szybkiego maskowania)
 // ════════════════════════════════════════════════════════════════════════════
-void ABI1176Processor::resizeDryDelay (int latencySamples, int numChannels)
+void ABI1176Processor::resizeDryDelay (int delaySamples, int numChannels)
 {
-    dryDelayLength = juce::jmax (0, latencySamples);
+    dryDelayLength = juce::jmax (0, delaySamples);
 
     // Bufor musi zmieścić: historię (dryDelayLength) + bieżący blok (currentSamplesPerBlock)
     // + zapas. Plus zaokrąglamy w górę do potęgi 2 dla szybkiego maskowania.
@@ -1219,17 +1219,14 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     };
 
     // ── DRIFT — mnożnik analogowej niedoskonałości ──────────────────────────
-    // Zwraca mnożnik wzmocnienia bliski 1.0 (±0.1 dB), modulowany bardzo
-    // wolnym sub-Hz dryfem.  Aktualizuje fazy oscylatorów.  Gdy przełącznik
-    // DRIFT wyłączony - zwraca dokładnie 1.0 (zero wpływu, zero kosztu fazy).
     const bool driftOn = driftParam->load() > 0.5f;
     // ±0.1 dB w skali liniowej: 10^(0.1/20) ≈ 1.01158
-    constexpr float driftDepth = 0.01158f;
-    auto driftGain = [this, driftOn] (int ch) -> float
+    // MSVC wymaga explicit capture dla constexpr lokalnych - używamy const float
+    const float driftDepth = 0.01158f;
+    auto driftGain = [this, driftOn, driftDepth] (int ch) -> float
     {
         if (! driftOn) return 1.0f;
         const int c = juce::jlimit (0, 1, ch);
-        // Suma trzech oscylatorów / 3 → wynik w zakresie -1..1
         float d = 0.0f;
         for (int k = 0; k < 3; ++k)
         {
@@ -1266,11 +1263,11 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             {
                 const float dry    = dryDelayBuf[(size_t) ch][(size_t) readPos];
                 const float wet    = buffer.getReadPointer (ch)[s];
-                // Drift: subtelny mnożnik analogowej niedoskonałości (±0.1 dB)
-                const float active = (dry * (1.0f - m) + wet * m) * o * driftGain (ch);
-                // Crossfade między czystym dry (czyli to co było w bypass) a active
+                // Drift: rozdzielone na 2 linie - MSVC nie akceptuje modyfikacji
+                // this->driftPhase w wyrażeniu inicjalizującym const float.
+                const float dg     = driftGain (ch);
+                const float active = (dry * (1.0f - m) + wet * m) * o * dg;
                 const float mixed  = dry * (1.0f - xf) + active * xf;
-                // Soft ceiling - bezpiecznik przeciw cyfrowemu przesterowaniu
                 buffer.getWritePointer (ch)[s] = softCeiling (mixed);
             }
             readPos = (readPos + 1) & dryDelayMask;
@@ -1293,7 +1290,8 @@ void ABI1176Processor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             {
                 const float dry    = dryBuffer.getReadPointer (ch)[s];
                 const float wet    = buffer   .getReadPointer (ch)[s];
-                const float active = (dry * (1.0f - m) + wet * m) * o * driftGain (ch);
+                const float dg     = driftGain (ch);
+                const float active = (dry * (1.0f - m) + wet * m) * o * dg;
                 const float mixed  = dry * (1.0f - xf) + active * xf;
                 buffer.getWritePointer (ch)[s] = softCeiling (mixed);
             }
