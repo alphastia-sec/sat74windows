@@ -1,0 +1,23 @@
+Alphastudio SAT 76 - Instalacja macOS
+======================================
+
+INSTALACJA (2 kroki):
+
+  1. Kliknij dwukrotnie "install.sh"
+     macOS zapyta "czy chcesz otworzyc?" -> kliknij "Otworz"
+
+  2. Uruchom ponownie DAW i wykonaj skanowanie wtyczek
+
+ALTERNATYWNIE (przez Terminal):
+  Otworz Terminal, przeciagnij "install.sh" do okna, nacisnij Enter
+
+LOKALIZACJA PO INSTALACJI:
+  VST3: ~/Library/Audio/Plug-Ins/VST3/
+  AU:   ~/Library/Audio/Plug-Ins/Components/
+
+ODINSTALOWANIE:
+  Usun pliki z powyzszych folderow
+
+======================================
+  Alphastudio | alphastudio.pl
+======================================
