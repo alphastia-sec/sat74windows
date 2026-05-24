@@ -69,7 +69,7 @@ private:
     void updateOversampling();
 
     // Pomocnicze - rozmiar / reset linii opóźniającej dry
-    void resizeDryDelay (int delaySamples, int numChannels);
+    void resizeDryDelay (int latencySamples, int numChannels);
     void resetDryDelay();
 
     std::atomic<float>* bypassParam     = nullptr;
