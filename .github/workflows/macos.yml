@@ -1,0 +1,238 @@
+name: Build macOS VST3/AU
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-macos:
+    name: Build on macOS
+    runs-on: macos-latest
+
+    steps:
+    # 1. Pobranie kodu
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    # 2. Pobranie JUCE
+    - name: Clone JUCE
+      run: git clone https://github.com/juce-framework/JUCE.git JUCE
+
+    # 3. Konfiguracja CMake (Xcode generator — buduje VST3 i AU jednocześnie)
+    - name: Configure CMake
+      run: |
+        cmake -B build \
+          -G Xcode \
+          -DCMAKE_BUILD_TYPE=Release
+
+    # 4. Build Release
+    - name: Build Plugin
+      run: |
+        cmake --build build \
+          --config Release \
+          --parallel
+
+    # 5. Debug — pokaż co zostało zbudowane
+    - name: List build artefacts
+      run: |
+        echo "=== Pliki VST3 ==="
+        find build -name "*.vst3" -type d 2>/dev/null || echo "brak .vst3"
+        echo "=== Pliki AU (component) ==="
+        find build -name "*.component" -type d 2>/dev/null || echo "brak .component"
+
+    # 6. Przygotuj paczkę do dystrybucji
+    - name: Package for distribution
+      run: |
+        # Znajdź pliki
+        VST3=$(find build -name "*.vst3" -type d | head -1)
+        AU=$(find build -name "*.component" -type d | head -1)
+
+        if [ -z "$VST3" ]; then
+          echo "ERROR: nie znaleziono pliku .vst3"
+          exit 1
+        fi
+
+        echo "VST3: $VST3"
+        echo "AU:   $AU"
+
+        # Utwórz folder dystrybucji
+        mkdir -p dist
+
+        # Skopiuj VST3
+        cp -R "$VST3" dist/
+
+        # Skopiuj AU jeśli istnieje
+        if [ -n "$AU" ]; then
+          cp -R "$AU" dist/
+        fi
+
+        # Pobierz nazwy plików
+        VST3_NAME=$(basename "$VST3")
+        AU_NAME=$(basename "$AU" 2>/dev/null || echo "")
+
+        # Utwórz skrypt instalatora
+        cat > dist/install.sh << 'INSTALL_SCRIPT'
+#!/bin/bash
+# ────────────────────────────────────────────────────────────────
+#  Alphastudio SAT 76 — Instalator macOS
+#  Wersja: 1.1.0
+# ────────────────────────────────────────────────────────────────
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VST3_DIR="$HOME/Library/Audio/Plug-Ins/VST3"
+AU_DIR="$HOME/Library/Audio/Plug-Ins/Components"
+
+echo ""
+echo "  ╔══════════════════════════════════════════╗"
+echo "  ║   Alphastudio SAT 76 — Instalator macOS  ║"
+echo "  ╚══════════════════════════════════════════╝"
+echo ""
+
+# Utwórz foldery jeśli nie istnieją
+mkdir -p "$VST3_DIR"
+mkdir -p "$AU_DIR"
+
+# ── Instalacja VST3 ──────────────────────────────────────────────
+VST3_FILE=$(find "$SCRIPT_DIR" -name "*.vst3" -maxdepth 1 | head -1)
+if [ -n "$VST3_FILE" ]; then
+  VST3_NAME=$(basename "$VST3_FILE")
+  echo "  → Instaluję VST3: $VST3_NAME"
+
+  # Usuń starą wersję jeśli istnieje
+  rm -rf "$VST3_DIR/$VST3_NAME"
+
+  # Skopiuj nową
+  cp -R "$VST3_FILE" "$VST3_DIR/"
+
+  # Usuń atrybut quarantine (bez tego macOS blokuje)
+  xattr -rd com.apple.quarantine "$VST3_DIR/$VST3_NAME" 2>/dev/null || true
+
+  echo "    ✓ Zainstalowano: $VST3_DIR/$VST3_NAME"
+else
+  echo "  ⚠ Nie znaleziono pliku .vst3 — pomiń"
+fi
+
+# ── Instalacja AU (Component) ────────────────────────────────────
+AU_FILE=$(find "$SCRIPT_DIR" -name "*.component" -maxdepth 1 | head -1)
+if [ -n "$AU_FILE" ]; then
+  AU_NAME=$(basename "$AU_FILE")
+  echo "  → Instaluję AU: $AU_NAME"
+
+  rm -rf "$AU_DIR/$AU_NAME"
+  cp -R "$AU_FILE" "$AU_DIR/"
+  xattr -rd com.apple.quarantine "$AU_DIR/$AU_NAME" 2>/dev/null || true
+
+  echo "    ✓ Zainstalowano: $AU_DIR/$AU_NAME"
+fi
+
+echo ""
+echo "  ✓ Instalacja zakończona!"
+echo ""
+echo "  Uruchom ponownie DAW i wykonaj skanowanie wtyczek."
+echo "  VST3: $VST3_DIR"
+echo "  AU:   $AU_DIR"
+echo ""
+INSTALL_SCRIPT
+
+        chmod +x dist/install.sh
+
+        # Utwórz README dla użytkownika
+        cat > dist/INSTALACJA.txt << 'README'
+══════════════════════════════════════════════
+  Alphastudio SAT 76 — Instalacja macOS
+══════════════════════════════════════════════
+
+INSTALACJA (2 kroki):
+
+  1. Kliknij dwukrotnie "install.sh"
+     macOS zapyta "czy chcesz otworzyć?" → kliknij "Otwórz"
+
+  2. Uruchom ponownie DAW i wykonaj skanowanie wtyczek
+
+ALTERNATYWNIE (przez Terminal):
+  Otwórz Terminal, przeciągnij "install.sh" do okna, naciśnij Enter
+
+LOKALIZACJA PO INSTALACJI:
+  VST3: ~/Library/Audio/Plug-Ins/VST3/
+  AU:   ~/Library/Audio/Plug-Ins/Components/
+
+ODINSTALOWANIE:
+  Usuń pliki z powyższych folderów
+
+══════════════════════════════════════════════
+  Alphastudio | alphastudio.pl
+══════════════════════════════════════════════
+README
+
+        echo ""
+        echo "=== Zawartość paczki dystrybucyjnej ==="
+        ls -la dist/
+
+    # 7. Spakuj do ZIP
+    - name: Create ZIP
+      run: |
+        cd dist
+        zip -r "../SAT_76_macOS.zip" .
+        cd ..
+        echo "=== Rozmiar ZIP ==="
+        ls -lh SAT_76_macOS.zip
+
+    # 8. Upload artefaktu
+    - name: Upload macOS Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: SAT_76-macOS
+        path: SAT_76_macOS.zip
+
+# ══════════════════════════════════════════════════════════════════
+# TODO — Podpisywanie i notaryzacja (odblokuj gdy masz Apple Developer)
+# ══════════════════════════════════════════════════════════════════
+#
+# Gdy masz certyfikat Apple Developer ID, dodaj do GitHub Secrets:
+#   APPLE_DEVELOPER_CERTIFICATE_P12     — certyfikat wyeksportowany z Keychain
+#   APPLE_DEVELOPER_CERTIFICATE_PASSWORD — hasło do .p12
+#   APPLE_ID                            — Twój Apple ID (email)
+#   APPLE_ID_PASSWORD                   — App-specific password z appleid.apple.com
+#   APPLE_TEAM_ID                       — Team ID z developer.apple.com
+#
+# Następnie odkomentuj kroki poniżej i wstaw PRZED krokiem "Package":
+#
+#    - name: Import Certificate
+#      env:
+#        CERTIFICATE_P12: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12 }}
+#        CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+#      run: |
+#        echo "$CERTIFICATE_P12" | base64 --decode > certificate.p12
+#        security create-keychain -p "" build.keychain
+#        security import certificate.p12 -k build.keychain \
+#          -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+#        security set-key-partition-list -S apple-tool:,apple: \
+#          -s -k "" build.keychain
+#        security list-keychains -d user -s build.keychain
+#
+#    - name: Sign Plugin
+#      run: |
+#        VST3=$(find build -name "*.vst3" -type d | head -1)
+#        codesign --force --deep --strict \
+#          --options runtime \
+#          --sign "Developer ID Application: Alphastudio (${{ secrets.APPLE_TEAM_ID }})" \
+#          "$VST3"
+#        echo "✓ Podpisano: $VST3"
+#
+#    - name: Notarize Plugin
+#      run: |
+#        zip -r plugin_to_notarize.zip dist/
+#        xcrun notarytool submit plugin_to_notarize.zip \
+#          --apple-id "${{ secrets.APPLE_ID }}" \
+#          --password "${{ secrets.APPLE_ID_PASSWORD }}" \
+#          --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+#          --wait
+#        xcrun stapler staple dist/*.vst3 dist/*.component
+#        echo "✓ Notaryzacja zakończona"
+#
