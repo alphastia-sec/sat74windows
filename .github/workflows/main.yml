@@ -27,20 +27,42 @@ jobs:
     - name: Build Plugin
       run: cmake --build build --config Release
 
-    # 5. Debug - pokaż co zostało zbudowane (pomaga przy problemach ze ścieżkami)
+    # 6. Debug - pokaż DOKŁADNIE co zostało zbudowane
     - name: List build artefacts
       run: |
-        Get-ChildItem -Path build -Recurse -Filter "*.vst3" | Select-Object FullName
+        Write-Host "=== Zawartosc folderu build ==="
+        Get-ChildItem -Path build -Recurse | Select-Object FullName
       shell: pwsh
 
-    # 6. Instalacja Inno Setup
+    # 7. Instalacja Inno Setup
     - name: Install Inno Setup
       run: choco install innosetup --yes --no-progress
 
-    # 7. Budowanie instalatora
+    # 8. Znajdź VST3 i zbuduj instalator
     - name: Build Windows Installer
-      shell: cmd
-      run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+      shell: pwsh
+      run: |
+        Write-Host "=== Szukam pliku VST3 ==="
+        $vst3 = Get-ChildItem -Path build -Recurse -Filter "*.vst3" | Select-Object -First 1
+        if ($null -eq $vst3) {
+          Write-Error "Nie znaleziono pliku .vst3 w folderze build!"
+          exit 1
+        }
+        Write-Host "Znaleziono: $($vst3.FullName)"
+        Write-Host "Folder: $($vst3.DirectoryName)"
+        
+        # Zaktualizuj ścieżkę w installer.iss
+        $issContent = Get-Content installer.iss -Raw
+        $newSource = "Source: `"$($vst3.FullName)\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs"
+        $issContent = $issContent -replace 'Source: "[^"]*"; DestDir: "\{app\}".*', $newSource
+        Set-Content installer.iss $issContent
+        
+        Write-Host "=== Zaktualizowany installer.iss ==="
+        Get-Content installer.iss
+        
+        # Uruchom Inno Setup
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     # 8. Upload gotowego instalatora
     - name: Upload Windows Installer
